@@ -58,6 +58,19 @@ MAX_PAGES = 30  # tope de seguridad por si la paginación se comporta raro
 # considerar que es un bloqueo real.
 CHALLENGE_WAIT_SECONDS = 15
 
+# Marcadores de bloqueo/captcha que aparecen en el título o cuerpo de la página.
+# Se utilizan en detect_block() para identificar páginas de Cloudflare o errores.
+BLOCK_MARKERS = (
+    "cloudflare",
+    "verificación de seguridad",
+    "protección de Cloudflare",
+    "solicitud denied",
+    "intenta más tarde",
+    "capcha",
+    "robot",
+    "automatizado",
+)
+
 # Histórico de precios. Las rutas se resuelven respecto a este fichero para que
 # el scraper funcione igual desde cualquier directorio de trabajo.
 DATA_DIR = Path(__file__).resolve().parent / "data"
@@ -745,6 +758,30 @@ def print_save_summary(summary: SaveSummary) -> None:
     print("  Nuevos, desaparecidos y cambios se comparan con la ejecución anterior.")
 
 
+def print_summary(
+    products: list[Product],
+    ti_products: list[Product],
+    skipped: list[str],
+    pages_scraped: int,
+    elapsed: float,
+) -> None:
+    """Imprime un resumen de los resultados del scraper."""
+    print(f"  Productos: {len(products)}")
+    if ti_products:
+        print(f"  RTX 5070 Ti: {len(ti_products)}")
+    print(f"  Páginas recorridas: {pages_scraped}")
+    print(f"  Tiempo transcurrido: {elapsed:.1f} s")
+    if skipped:
+        print(f"  Omitidos: {', '.join(skipped)}")
+
+
+def print_table(products: list[Product]) -> None:
+    """Imprime una tabla con los productos detectados."""
+    for product in products:
+        price_str = format_price(product.price) if product.price else "N/A"
+        print(f"  • {product.name} — {price_str}")
+
+
 def print_results(
     products: list[Product],
     ti_products: list[Product],
@@ -770,6 +807,106 @@ def print_results(
 
     if not products:
         print("\nNo se encontró ningún PC con RTX 5070 en el listado.")
+
+
+def scrape():
+    """Ejecuta el scrapeo completo de la lista de productos de RTX 5070.
+
+    Navega por todas las páginas de PcComponentes, extrae los datos de
+    cada tarjeta de producto y devuelve la lista de productos, productos
+    Ti, los SKU skippeados y el número de páginas recorridas.
+
+    Returns:
+        tuple: (products, ti_products, skipped, pages_scraped)
+    """
+    products = []
+    ti_products = []
+    skipped = []
+    pages_scraped = 0
+
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=HEADLESS)
+        context = browser.new_context(
+            user_agent=USER_AGENT,
+            locale=LOCALE,
+            timezone=TIMEZONE,
+        )
+        page = context.new_page()
+
+        try:
+            page.goto(BASE_URL)
+            # Esperar a que aparezcan las tarjetas o que haya bloqueo
+            result = wait_for_listing(page, None)
+            if result is not None:
+                browser.close()
+                raise ScraperError(result)
+
+            pages_scraped = 1
+
+            while pages_scraped < MAX_PAGES:
+                # Extraer productos de la página actual usando el JS de extracción
+                cards = page.locator(CARD_SELECTOR).all()
+                card_count = len(cards)
+                if card_count == 0:
+                    break
+
+                # Ejecutar extracción en todas las tarjetas a la vez
+                card_data_list = page.evaluate(EXTRACT_JS, cards)
+
+                for i in range(card_count):
+                    card_data = card_data_list[i]
+                    try:
+                        # Parse price and previous_price
+                        price = parse_price(card_data.get('price'))
+                        previous_price = parse_price(card_data.get('previous_price'))
+
+                        # Build specifications from name
+                        specs = extract_specifications(card_data.get('card_text') or '')
+
+                        # Build Product object
+                        product = build_product(
+                            card_data,
+                            specs,
+                        )
+
+                        if product is not None:
+                            if product.name.lower().find('ti') >= 0 or product.gpu.lower().find('ti') >= 0:
+                                ti_products.append(product)
+                            else:
+                                products.append(product)
+                    except Exception:
+                        skipped.append(card_data.get('sku', 'unknown') or f'card-{i}')
+                        continue
+
+                # Intentar navegar a la siguiente página
+                next_url = next_page_url(page)
+                if next_url is None:
+                    break
+
+                page.goto(next_url)
+                pages_scraped += 1
+
+                # Verificar bloqueo en la página siguiente
+                result = wait_for_listing(page, None)
+                if result is not None:
+                    browser.close()
+                    raise ScraperError(result)
+
+        except ScraperError:
+            raise
+        except Exception as e:
+            browser.close()
+            raise ScraperError(
+                f"Error durante el scrapeo: {e}",
+                products=products,
+                ti_products=ti_products,
+                skipped=skipped,
+                pages_scraped=pages_scraped,
+            )
+
+    return products, ti_products, skipped, pages_scraped
 
 
 def main(argv: list[str] | None = None) -> int:
