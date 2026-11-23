@@ -1,4 +1,0 @@
-fecha,hora,sku,precio,precio_anterior,descuento,disponibilidad
-2026-11-23,09:10:55,10650846,2489.00,3659.00,32,"Entrega a partir del martes, 24 de noviembre"
-2026-11-24,09:15:00,10650846,2399.00,3849.00,38,"Entrega a partir del miércoles, 25 de noviembre"
-2026-11-25,09:20:00,10650846,2350.00,3799.00,38,"Entrega a partir del jueves, 26 de noviembre"

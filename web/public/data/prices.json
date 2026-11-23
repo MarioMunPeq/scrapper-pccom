@@ -1,22 +1,40 @@
 [
   {
-    "sku": "10650846",
-    "name": "PC Test RTX 5070",
-    "currentPrice": 2350,
-    "previousPrice": 2399,
-    "discount": 38,
-    "minPriceHistorico": 2350,
-    "maxPriceHistorico": 2489,
-    "variation7d": -2,
-    "totalRegistros": 3,
+    "sku": "11011276",
+    "name": "PcCom Imperial AMD Ryzen 7 5700X / RTX 5070 / Windows 11 Home",
+    "currentPrice": 1799,
+    "previousPrice": 2299,
+    "discount": 22,
     "attributes": {
       "cpu": "",
       "ram": "",
       "ssd": "",
       "marca": ""
     },
-    "hito": null,
-    "esMuestra": false,
-    "motivoMuestra": ""
+    "minPriceHistorico": 1259,
+    "maxPriceHistorico": 2339,
+    "variation7d": 0,
+    "totalRegistros": 1,
+    "esMuestra": true,
+    "motivoMuestra": "Datos insuficientes en el histórico real (< 3 días). Se muestran datos de ejemplo deterministas para demostrar la funcionalidad."
+  },
+  {
+    "sku": "10650846",
+    "name": "PCM Interceptor Intel Core i7-12700KF/32GB/1TB SSD/RTX 5070 12GB",
+    "currentPrice": 2489,
+    "previousPrice": 3659,
+    "discount": 32,
+    "attributes": {
+      "cpu": "",
+      "ram": "",
+      "ssd": "",
+      "marca": ""
+    },
+    "minPriceHistorico": 1742,
+    "maxPriceHistorico": 3236,
+    "variation7d": 0,
+    "totalRegistros": 1,
+    "esMuestra": true,
+    "motivoMuestra": "Datos insuficientes en el histórico real (< 3 días). Se muestran datos de ejemplo deterministas para demostrar la funcionalidad."
   }
 ]

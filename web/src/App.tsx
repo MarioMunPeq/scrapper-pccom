@@ -50,10 +50,8 @@ function useFilters(prices) {
     if (search && !p.name.toLowerCase().includes(search.toLowerCase())) return false
     if (p.currentPrice < minPrice || p.currentPrice > maxPrice) return false
     if (onlyDiscount && (p.discount === null || p.discount === 0)) return false
-    if (cpuFilter && !p.attributes.cpu.toLowerCase().includes(cpuFilter.toLowerCase()))
-      return false
-    if (ramFilter && !p.attributes.ram.toLowerCase().includes(ramFilter.toLowerCase()))
-      return false
+    if (cpuFilter && !p.attributes.cpu.toLowerCase().includes(cpuFilter.toLowerCase())) return false
+    if (ramFilter && !p.attributes.ram.toLowerCase().includes(ramFilter.toLowerCase())) return false
     return true
   })
 
@@ -112,9 +110,6 @@ function SampleWarning() {
 
 export default function App() {
   const { prices, showSampleWarning } = usePrices()
-  const { sorted, ...filters } = usePrices()
-
-  // Re- call useFilters
   const {
     search, setSearch,
     minPrice, setMinPrice,
@@ -123,12 +118,12 @@ export default function App() {
     cpuFilter, setCpuFilter,
     ramFilter, setRamFilter,
     sortBy, setSortBy,
-    sorted: sorted2,
+    sorted,
   } = useFilters(prices)
 
   return (
     <main className="app">
-      {/* Hero section con KPIs */}
+      {/* Hero section con KPIs globales */}
       <section className="hero" aria-label="KPIs globales">
         <h1>pc-price-tracker</h1>
         <p>Histórico de precios de PCs con RTX 5070</p>
@@ -181,40 +176,34 @@ export default function App() {
             type="text"
             placeholder="Buscar..."
             value={search}
-            onChange={(e) => setSearch(e.target.value)} />
+            onChange={e => setSearch(e.target.value)} />
           <input
             type="number"
             min="0"
             placeholder="Precio mínimo"
             value={minPrice}
-            onChange={(e) =>
-              setMinPrice(e.target.value ? parseFloat(e.target.value) : 0),
-            } />
+            onChange={e => setMinPrice(e.target.value ? parseFloat(e.target.value) : 0)} />
           <input
             type="number"
             min="0"
             placeholder="Precio máximo"
             value={maxPrice}
-            onChange={(e) =>
-              setMaxPrice(e.target.value ? parseFloat(e.target.value) : Infinity),
-            } />
-          <select value={onlyDiscount} onChange={(e) =>
-            setOnlyDiscount(e.target.value === 'true')}
-          >
+            onChange={e => setMaxPrice(e.target.value ? parseFloat(e.target.value) : Infinity)} />
+          <select value={onlyDiscount ? 'true' : 'false'} onChange={e => setOnlyDiscount(e.target.value === 'true')}>
             <option value="false">Mostrar todos</option>
             <option value="true">Solo con descuento</option>
           </select>
-          <select value={cpuFilter} onChange={(e) => setCpuFilter(e.target.value)}>
+          <select value={cpuFilter} onChange={e => setCpuFilter(e.target.value)}>
             <option value="">Todo CPU</option>
             <option value="Intel">Intel</option>
             <option value="AMD">AMD</option>
           </select>
-          <select value={ramFilter} onChange={(e) => setRamFilter(e.target.value)}>
+          <select value={ramFilter} onChange={e => setRamFilter(e.target.value)}>
             <option value="">Todo RAM</option>
             <option value="16GB">16GB</option>
             <option value="32GB">32GB</option>
           </select>
-          <select value={sortBy} onChange={(e) => setSortBy(e.target.value)}>
+          <select value={sortBy} onChange={e => setSortBy(e.target.value)}>
             <option value="name">Nombre (A-Z)</option>
             <option value="price">Precio (menor/mayor)</option>
             <option value="discount">Descuento (mayor/menor)</option>

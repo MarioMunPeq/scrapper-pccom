@@ -3,3 +3,11 @@ __pycache__/
 *.py[cod]
 
 actions-runner/
+
+node_modules/
+web/dist/
+web/public/data/prices.json
+actions-runner/
+.venv/
+__pycache__/
+*.py[cod]
