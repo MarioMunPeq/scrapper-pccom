@@ -451,6 +451,28 @@ p { margin-bottom: 1rem; }
   color: var(--muted);
 }
 
+/* Banner de error cuándo falla el fetch de datos */
+.error-banner {
+  background: var(--bg-elevated);
+  border: 1px solid var(--danger);
+  color: var(--danger);
+  padding: 1rem 1.25rem;
+  margin-bottom: 1.5rem;
+  border-radius: 8px;
+  text-align: center;
+}
+
+.error-banner span {
+  font-weight: 600;
+  font-size: 0.875rem;
+}
+
+.error-banner p {
+  margin-top: 0.25rem;
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
 /* Responsive */
 @media (max-width: 640px) {
   .app {
