@@ -6,20 +6,29 @@ pc-price-tracker
 Scraper de PCs de sobremesa con RTX 5070 en PcComponentes.
 
 Recorre el listado completo (todas las páginas), extrae los datos de cada
-tarjeta de producto y los imprime por consola en una tabla. No guarda nada.
+tarjeta de producto y los imprime por consola en una tabla. Además guarda un
+histórico de precios en data/ (products.json + history.csv).
 
 Uso:
-    python scraper.py
+    python scraper.py            # scrapea, muestra la tabla y guarda el histórico
+    python scraper.py --no-save  # solo muestra la tabla por consola
 """
 
 from __future__ import annotations
 
+import argparse
+import csv
+import io
+import json
+import os
 import random
 import re
 import sys
 import textwrap
 import time
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -48,6 +57,21 @@ MAX_PAGES = 30  # tope de seguridad por si la paginación se comporta raro
 # completo suele resolverse solo en unos segundos. Le damos margen antes de
 # considerar que es un bloqueo real.
 CHALLENGE_WAIT_SECONDS = 15
+
+# Histórico de precios. Las rutas se resuelven respecto a este fichero para que
+# el scraper funcione igual desde cualquier directorio de trabajo.
+DATA_DIR = Path(__file__).resolve().parent / "data"
+PRODUCTS_FILE = DATA_DIR / "products.json"
+HISTORY_FILE = DATA_DIR / "history.csv"
+HISTORY_FIELDS = (
+    "fecha",
+    "hora",
+    "sku",
+    "precio",
+    "precio_anterior",
+    "descuento",
+    "disponibilidad",
+)
 
 GRID_SELECTOR = "#product-listing-product-grid"
 CARD_SELECTOR = f"{GRID_SELECTOR} a[data-product-id]"
@@ -530,6 +554,238 @@ def scrape() -> tuple[list[Product], list[Product], list[str], int]:
     )
 
 
+# ---------------------------------------------------------------------------
+# Histórico en disco
+# ---------------------------------------------------------------------------
+
+
+class StorageError(RuntimeError):
+    """Error controlado al leer o escribir los ficheros del histórico."""
+
+
+@dataclass(frozen=True)
+class SaveSummary:
+    saved: int
+    new: int
+    disappeared: int
+    price_changes: int
+    catalog_total: int
+
+
+def display_path(path: Path) -> str:
+    """Ruta relativa a la carpeta del scraper, para mensajes más legibles."""
+    try:
+        return path.relative_to(DATA_DIR.parent).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def _write_atomic(path: Path, content: str) -> None:
+    """Escribe el fichero completo de forma atómica (temporal + reemplazo)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8", newline="") as handle:
+            handle.write(content)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def load_catalog() -> dict[str, dict[str, str]]:
+    """Lee data/products.json (un registro por SKU con nombre y URL)."""
+    if not PRODUCTS_FILE.exists():
+        return {}
+
+    try:
+        raw = json.loads(PRODUCTS_FILE.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeDecodeError) as exc:
+        raise StorageError(
+            f"No se pudo leer {display_path(PRODUCTS_FILE)}: {exc}"
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise StorageError(
+            f"{display_path(PRODUCTS_FILE)} no contiene JSON válido ({exc}). "
+            "Revísalo o bórralo para empezar de cero."
+        ) from exc
+
+    if not isinstance(raw, dict):
+        raise StorageError(
+            f"{display_path(PRODUCTS_FILE)} debe ser un objeto JSON "
+            "con un registro por SKU."
+        )
+
+    catalog: dict[str, dict[str, str]] = {}
+    for sku, record in raw.items():
+        if not isinstance(record, dict):
+            raise StorageError(
+                f"El registro {sku!r} de {display_path(PRODUCTS_FILE)} "
+                "no es un objeto JSON."
+            )
+        catalog[str(sku)] = {
+            "name": str(record.get("name") or ""),
+            "url": str(record.get("url") or ""),
+        }
+    return catalog
+
+
+def save_catalog(catalog: dict[str, dict[str, str]]) -> None:
+    content = json.dumps(catalog, ensure_ascii=False, indent=2, sort_keys=True)
+    _write_atomic(PRODUCTS_FILE, content + "\n")
+
+
+def load_history() -> list[dict[str, str]]:
+    """Lee data/history.csv. Devuelve las filas con las columnas esperadas."""
+    if not HISTORY_FILE.exists():
+        return []
+
+    try:
+        with HISTORY_FILE.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            columns = reader.fieldnames or []
+            missing = [field for field in HISTORY_FIELDS if field not in columns]
+            if missing:
+                raise StorageError(
+                    f"{display_path(HISTORY_FILE)} no tiene las columnas "
+                    f"esperadas (faltan: {', '.join(missing)})."
+                )
+
+            rows: list[dict[str, str]] = []
+            for row in reader:
+                if not any(
+                    str(value).strip()
+                    for value in row.values()
+                    if value is not None
+                ):
+                    continue  # línea en blanco
+                rows.append(
+                    {
+                        field: (row.get(field) or "").strip()
+                        for field in HISTORY_FIELDS
+                    }
+                )
+            return rows
+    except (OSError, UnicodeDecodeError, csv.Error) as exc:
+        raise StorageError(
+            f"No se pudo leer {display_path(HISTORY_FILE)}: {exc}"
+        ) from exc
+
+
+def save_history(rows: list[dict[str, str]]) -> None:
+    buffer = io.StringIO()
+    writer = csv.DictWriter(
+        buffer,
+        fieldnames=HISTORY_FIELDS,
+        lineterminator="\n",
+        extrasaction="ignore",
+    )
+    writer.writeheader()
+    writer.writerows(rows)
+    _write_atomic(HISTORY_FILE, buffer.getvalue())
+
+
+def history_row(product: Product, date: str, clock: str) -> dict[str, str]:
+    """Fila de histórico con precios como número (sin € ni separador de miles)."""
+    return {
+        "fecha": date,
+        "hora": clock,
+        "sku": product.sku,
+        "precio": "" if product.price is None else f"{product.price:.2f}",
+        "precio_anterior": (
+            "" if product.previous_price is None else f"{product.previous_price:.2f}"
+        ),
+        "descuento": (
+            "" if product.discount_pct is None else str(product.discount_pct)
+        ),
+        "disponibilidad": product.availability,
+    }
+
+
+def previous_run_rows(
+    history: list[dict[str, str]], today: str
+) -> dict[str, dict[str, str]]:
+    """
+    Filas de la última ejecución guardada (de un día anterior o de hoy mismo,
+    cuyas filas se van a reemplazar). Sirve para calcular nuevos,
+    desaparecidos y cambios de precio.
+    """
+    dates = sorted({row["fecha"] for row in history if row["fecha"] <= today})
+    if not dates:
+        return {}
+    last_date = dates[-1]
+    return {row["sku"]: row for row in history if row["fecha"] == last_date}
+
+
+def save_run(products: list[Product], *, now: datetime | None = None) -> SaveSummary:
+    """Actualiza data/products.json y data/history.csv con la ejecución actual."""
+    if not products:
+        raise StorageError("No hay productos que guardar.")
+
+    now = now or datetime.now()
+    date = now.strftime("%Y-%m-%d")
+    clock = now.strftime("%H:%M:%S")
+
+    catalog = load_catalog()
+    history = load_history()
+    previous = previous_run_rows(history, date)
+
+    today_skus = {product.sku for product in products}
+    new_count = len(today_skus - set(catalog))
+    disappeared = len(set(previous) - today_skus) if previous else 0
+
+    price_changes = 0
+    for product in products:
+        previous_row = previous.get(product.sku)
+        if previous_row is None or product.price is None:
+            continue
+        previous_price = parse_price(previous_row.get("precio"))
+        if previous_price is not None and abs(product.price - previous_price) >= 0.005:
+            price_changes += 1
+
+    # El catálogo es acumulativo: los productos que ya no salen no se borran.
+    updated_catalog = dict(catalog)
+    for product in products:
+        updated_catalog[product.sku] = {
+            "name": product.name,
+            "url": product.url,
+        }
+
+    # Solo se conservan las filas de otros días; las de hoy se sustituyen.
+    kept_rows = [row for row in history if row["fecha"] != date]
+    today_rows = [
+        history_row(product, date, clock)
+        for product in sorted(products, key=lambda item: item.sku)
+    ]
+
+    save_catalog(updated_catalog)
+    save_history(kept_rows + today_rows)
+
+    return SaveSummary(
+        saved=len(products),
+        new=new_count,
+        disappeared=disappeared,
+        price_changes=price_changes,
+        catalog_total=len(updated_catalog),
+    )
+
+
+def print_save_summary(summary: SaveSummary) -> None:
+    print()
+    print("=" * 78)
+    print("HISTÓRICO GUARDADO")
+    print(
+        f"  Ficheros:                    {display_path(PRODUCTS_FILE)}, "
+        f"{display_path(HISTORY_FILE)}"
+    )
+    print(f"  Productos guardados hoy:     {summary.saved}")
+    print(f"  Nuevos:                      {summary.new}")
+    print(f"  Desaparecidos:               {summary.disappeared}")
+    print(f"  Cambios de precio:           {summary.price_changes}")
+    print(f"  Catálogo acumulado:          {summary.catalog_total}")
+    print("=" * 78)
+    print("  Nuevos, desaparecidos y cambios se comparan con la ejecución anterior.")
+
+
 def print_results(
     products: list[Product],
     ti_products: list[Product],
@@ -562,13 +818,30 @@ def print_results(
 # ---------------------------------------------------------------------------
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Scraper de PCs de sobremesa con RTX 5070 en PcComponentes, "
+            "con histórico de precios en data/."
+        )
+    )
+    parser.add_argument(
+        "--no-save",
+        action="store_true",
+        help="No guarda el histórico en data/: solo muestra la tabla por consola.",
+    )
+    args = parser.parse_args(argv)
+
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
     started = time.monotonic()
     print("pc-price-tracker · PCs de sobremesa con RTX 5070 · PcComponentes")
     print(f"Listado: {BASE_URL}")
+    print(
+        "Guardado: "
+        + ("desactivado (--no-save)" if args.no_save else "activado (data/)")
+    )
     print()
 
     try:
@@ -608,6 +881,27 @@ def main() -> int:
     print_results(
         products, ti_products, skipped, pages_scraped, time.monotonic() - started
     )
+
+    if args.no_save:
+        return 0
+
+    if not products:
+        print(
+            "\n[AVISO] No hay productos con RTX 5070; no se guarda el histórico.",
+            file=sys.stderr,
+        )
+        return 0
+
+    try:
+        summary = save_run(products)
+    except (StorageError, OSError) as exc:
+        print(
+            f"\n[ERROR] No se pudo guardar el histórico: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+
+    print_save_summary(summary)
     return 0
 
 

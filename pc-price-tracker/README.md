@@ -11,7 +11,8 @@ en una tabla.
   segundos entre páginas.
 - Usa el **SKU** (`data-product-id`) como identificador único.
 - Si detecta un **bloqueo o captcha**, se detiene y avisa (no reintenta).
-- **No guarda nada**: solo imprime por consola.
+- Guarda un **histórico de precios** en `data/` (`products.json` y
+  `history.csv`). Con `--no-save` solo imprime por consola.
 
 ## Requisitos
 
@@ -39,7 +40,8 @@ playwright install chromium
 ## Uso
 
 ```powershell
-python scraper.py
+python scraper.py            # scrapea, muestra la tabla y guarda el histórico
+python scraper.py --no-save  # solo muestra la tabla por consola
 ```
 
 Salida esperada (resumida):
@@ -76,6 +78,67 @@ RESULTADOS: 646 PCs de sobremesa con RTX 5070
 Ejecución de referencia: **17 páginas y 646 productos** (el listado completo en el
 momento de la prueba).
 
+Si el guardado está activado, al final se añade:
+
+```
+==============================================================================
+HISTÓRICO GUARDADO
+  Ficheros:                    data/products.json, data/history.csv
+  Productos guardados hoy:     646
+  Nuevos:                      0
+  Desaparecidos:               0
+  Cambios de precio:           12
+  Catálogo acumulado:          651
+==============================================================================
+  Nuevos, desaparecidos y cambios se comparan con la ejecución anterior.
+```
+
+## Histórico de precios
+
+La primera ejecución crea automáticamente la carpeta `data/`:
+
+- **`data/products.json`**: catálogo acumulado, con un registro por SKU:
+
+  ```json
+  {
+    "11011276": {
+      "name": "PcCom Imperial AMD Ryzen 7 5700X / RTX 5070 / Windows 11 Home",
+      "url": "https://www.pccomponentes.com/pccom-imperial-..."
+    }
+  }
+  ```
+
+  Si cambian el nombre o la URL de un producto, se actualizan. Los productos
+  que dejan de aparecer **no se borran**: simplemente no tendrán fila ese día.
+
+- **`data/history.csv`**: formato largo, una fila por producto y día:
+
+  ```csv
+  fecha,hora,sku,precio,precio_anterior,descuento,disponibilidad
+  2026-11-23,09:10:55,10650846,2489.00,3659.00,32,"Entrega a partir del martes, 24 de noviembre"
+  ```
+
+  - `fecha` (`YYYY-MM-DD`) y `hora` (`HH:MM:SS`) usan la hora local del equipo.
+  - `precio` y `precio_anterior` son números (punto decimal, sin `€` ni
+    separador de miles); quedan vacíos si no hay dato.
+  - `precio_anterior` es el **PVPR** (precio tachado), no siempre un precio
+    anterior real.
+  - `descuento` es el porcentaje entero respecto al PVPR (`32` = 32 %); vacío
+    si no hay descuento.
+  - El fichero se guarda en UTF-8 y el texto se entrecomilla solo cuando hace
+    falta (por ejemplo, disponibilidad con comas).
+
+**Varias ejecuciones el mismo día**: antes de escribir, se eliminan las filas
+de la fecha actual y se añaden las de esta ejecución, de modo que solo queda la
+última del día (sin duplicados). El resto de fechas se conserva.
+
+**Bloqueos**: si el scraper se detiene por captcha o bloqueo, muestra los
+resultados parciales por consola pero **no escribe nada** en el histórico, para
+no guardar datos incompletos.
+
+Las escrituras son atómicas (fichero temporal + reemplazo) para no corromper el
+histórico si el proceso se interrumpe.
+
 ## Notas
 
 - **Precio anterior / PVPR**: PcComponentes muestra como precio tachado el
@@ -102,7 +165,10 @@ momento de la prueba).
   automático se resuelva; si no se resuelve, termina con código de salida `2`
   y un mensaje claro. No reintenta indefinidamente.
 - **Resultados parciales**: si se detiene por bloqueo, muestra igualmente los
-  productos que ya había recogido, indicando que son parciales.
+  productos que ya había recogido, indicando que son parciales, pero **no
+  escribe en el histórico**.
+- **Rutas del histórico**: `data/` se resuelve respecto a `scraper.py`, no al
+  directorio desde el que se ejecuta el comando.
 - El navegador se ejecuta en modo *headless* por defecto. Para verlo, cambia
   `HEADLESS = True` a `False` en `scraper.py`.
 - Si PcComponentes cambia el HTML, los selectores a revisar están agrupados al
