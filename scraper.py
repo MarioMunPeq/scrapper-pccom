@@ -831,7 +831,7 @@ def scrape():
         context = browser.new_context(
             user_agent=USER_AGENT,
             locale=LOCALE,
-            timezone=TIMEZONE,
+            timezone_id=TIMEZONE,
         )
         page = context.new_page()
 
