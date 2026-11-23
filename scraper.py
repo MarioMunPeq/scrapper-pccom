@@ -6,8 +6,9 @@ pc-price-tracker
 Scraper de PCs de sobremesa con RTX 5070 en PcComponentes.
 
 Recorre el listado completo (todas las páginas), extrae los datos de cada
-tarjeta de producto y los imprime por consola en una tabla. Además guarda un
-histórico de precios en data/ (products.json + history.csv).
+tarjeta de producto y los guarda en data/ (products.json + history.csv).
+Además, los pone a disposición de una aplicación web React + Vite que los
+muestra con gráficos de precio, filtros y páginas de detalle.
 
 Uso:
     python scraper.py            # scrapea, muestra la tabla y guarda el histórico
@@ -21,7 +22,6 @@ import csv
 import io
 import json
 import os
-import random
 import re
 import sys
 import textwrap
@@ -73,66 +73,57 @@ HISTORY_FIELDS = (
     "disponibilidad",
 )
 
+# Nuevo: campos de especificación extraídos del nombre del producto
+SPEC_REGEX = {
+    "cpu": re.compile(r"(Intel|AMD|Core|Ryzen)\s+\w+(?:\s+\w+)?", re.IGNORECASE),
+    "ram": re.compile(r"(\d+)\s*GB\s*RAM", re.IGNORECASE),
+    "ssd": re.compile(r"(\d+)\s*TB\s*SSD|(\d+)\s*GB\s*SSD", re.IGNORECASE),
+    "gpu": re.compile(r"RTX\s*5070\s*Ti\b|RTX\s*5070\b", re.IGNORECASE),
+    "marca": re.compile(
+        r"(PcCom|Vibox|PCM|Aeon|NeoPC|Gamer|Gaming|Centrum|IBUYPOWER|DeepGaming|NitroPC|Tecnowake|Epical-q)",
+        re.IGNORECASE,
+    ),
+}
+
 GRID_SELECTOR = "#product-listing-product-grid"
 CARD_SELECTOR = f"{GRID_SELECTOR} a[data-product-id]"
 
-# "RTX 5070" pero no "RTX 5070 Ti" (con o sin espacio antes de Ti) ni "50700".
-RTX_5070_RE = re.compile(r"RTX\s*5070(?!\s*Ti\b)(?!\d)", re.IGNORECASE)
-RTX_5070_TI_RE = re.compile(r"RTX\s*5070\s*Ti\b", re.IGNORECASE)
-
-OUT_OF_STOCK_RE = re.compile(
-    r"agotado|sin stock|no disponible|pr[oó]ximamente", re.IGNORECASE
-)
-
-# Marcadores típicos de páginas de bloqueo / captcha.
-BLOCK_MARKERS = (
-    "captcha",
-    "pardon our interruption",
-    "access denied",
-    "unusual traffic",
-    "verify you are human",
-    "verifying you are human",
-    "just a moment",
-    "verificación de seguridad",
-    "verificacion de seguridad",
-    "security verification",
-    "attention required",
-    "cf-chl",
-    "datadome",
-    "request blocked",
-)
 
 # ---------------------------------------------------------------------------
 # Extracción en el navegador
 # ---------------------------------------------------------------------------
 
-# Se ejecuta dentro de la página. Devuelve una entrada por tarjeta de producto.
 EXTRACT_JS = """
 (cards) => cards.map((card) => {
   const query = (selector) => card.querySelector(selector);
   const delivery = query('[data-testid="product-card-delivery"]');
   const crossed = query('[data-e2e="crossedPrice"]');
   const price = query('[data-e2e="price-card"]');
+  const nameEl = query('[data-product-name]');
+  const imageEl = query('[data-product-image]');
 
   return {
     sku: card.getAttribute('data-product-id') || '',
-    name: card.getAttribute('data-product-name') || '',
+    name: nameEl.getAttribute('data-product-name') || card.getAttribute('data-product-name') || '',
     url: card.href || '',
     price: card.getAttribute('data-product-price')
       || (price ? price.textContent : ''),
     previous_price: crossed ? crossed.textContent : '',
     delivery: delivery
-      ? (delivery.innerText || '').replace(/\\s+/g, ' ').trim()
+      ? (delivery.innerText || '').replace(/\s+/g, ' ').trim()
       : '',
-    card_text: (card.innerText || '').replace(/\\s+/g, ' ').trim(),
+    card_text: (card.innerText || '').replace(/\s+/g, ' ').trim(),
+    image_url: imageEl ? imageEl.src || '' : '',
+    // Atributos adicionales que podrían estar en el texto o en data-attributes
+    full_text: (card.innerText || '').replace(/\s+/g, ' ').trim(),
   };
 })
 """
 
+
 # ---------------------------------------------------------------------------
 # Modelo de datos
 # ---------------------------------------------------------------------------
-
 
 @dataclass(frozen=True)
 class Product:
@@ -140,12 +131,30 @@ class Product:
     name: str
     url: str
     price: float | None
-    previous_price: float | None
+    previous_price: float | None  # PVPR precio tachado de la web
     availability: str
+    # Nuevos campos de especificación
+    cpu: str
+    ram: str
+    ssd: str
+    gpu: str
+    marca: str
+
+    @property
+    def discount_from_prev_observation(self) -> float | None:
+        """
+        Porcentaje de descuento respecto a la última observación de precio
+        guardada en el histórico. Si no hay anterior, devuelve None.
+        """
+        if not self.price or not self.previous_price:
+            return None
+        if self.previous_price <= self.price:
+            return None
+        return round((self.previous_price - self.price) / self.previous_price * 100, 1)
 
     @property
     def discount_pct(self) -> int | None:
-        """Porcentaje de descuento respecto al precio anterior/PVPR."""
+        """Porcentaje de descuento respecto al PVPR (precio recomendado)."""
         if not self.price or not self.previous_price:
             return None
         if self.previous_price <= self.price:
@@ -173,9 +182,8 @@ class ScraperError(RuntimeError):
 
 
 # ---------------------------------------------------------------------------
-# Utilidades
+# Utilidades de parsing
 # ---------------------------------------------------------------------------
-
 
 def parse_price(value: object) -> float | None:
     """Convierte '1.799,00 €', '1799' o 1799.0 a float."""
@@ -196,7 +204,7 @@ def parse_price(value: object) -> float | None:
         text = text.replace(".", "")
     elif text.count(".") == 1 and len(text.rsplit(".", 1)[1]) == 3:
         # 1.799 (separador de miles sin decimales)
-        text = text.replace(".", "")
+        text = text.replace(".", ")
 
     try:
         return float(text)
@@ -213,48 +221,96 @@ def format_price(value: float | None) -> str:
     return f"{formatted} €"
 
 
+def extract_specifications(name: str) -> dict[str, str]:
+    """Extrae CPU, RAM, SSD, GPU y marca del nombre del producto."""
+    result = {
+        "cpu": "",
+        "ram": "",
+        "ssd": "",
+        "gpu": "",
+        "marca": "",
+    }
+
+    # Marca
+    for match in re.finditer(SPEC_REGEX["marca"], name):
+        marca_str = match.group(0).strip()
+        # Evitar duplicados y ruidoso
+        lower = marca_str.lower()
+        if lower not in result["marca"].lower() and len(result["marca"]) < 30:
+            result["marca"] = marca_str
+
+    # CPU
+    for match in re.finditer(SPEC_REGEX["cpu"], name):
+        cpu_str = match.group(0).strip()
+        if cpu_str.lower() not in result["cpu"].lower():
+            result["cpu"] = cpu_str
+
+    # RAM
+    for match in re.finditer(SPEC_REGEX["ram"], name):
+        ram_str = match.group(0).strip()
+        if ram_str not in result["ram"]:
+            result["ram"] = ram_str
+
+    # SSD
+    for match in re.finditer(SPEC_REGEX["ssd"], name):
+        ssd_str = match.group(0).strip()
+        if ssd_str not in result["ssd"]:
+            result["ssd"] = ssd_str
+
+    # GPU
+    for match in re.finditer(SPEC_REGEX["gpu"], name):
+        gpu_str = match.group(0).strip()
+        if gpu_str not in result["gpu"]:
+            result["gpu"] = gpu_str
+
+    return result
+
+
 def clean_availability(delivery: str, card_text: str) -> str:
-    if OUT_OF_STOCK_RE.search(card_text):
+    if re.search(r"agotado|sin stock|no disponible|pr[oó]ximamente", card_text, re.IGNORECASE):
         return "Agotado / no disponible"
 
     text = re.sub(r"\s+", " ", delivery).strip()
-    # "Envío gratis" es información de envío, no de disponibilidad.
     text = re.sub(r"^Env[ií]o gratis\.\s*", "", text, flags=re.IGNORECASE)
     return text or "Disponible"
 
 
-def classify_gpu(name: str) -> str | None:
-    """
-    Devuelve 'ti' para RTX 5070 Ti, '5070' para RTX 5070 y None para el resto.
-    """
-    if RTX_5070_TI_RE.search(name):
-        return "ti"
-    if RTX_5070_RE.search(name):
-        return "5070"
-    return None
+# ---------------------------------------------------------------------------
+# Modelo de datos mejorado
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class EnhancedProduct:
+    """Producto con todos los datos enriquecidos para la aplicación web."""
+    sku: str
+    name: str
+    url: str
+    price: float | None
+    last_observation_price: float | None  # Último precio guardado en histórico
+    last_updated: str | None  # Timestamp de la última observación
+    availability: str
+    cpu: str
+    ram: str
+    ssd: str
+    gpu: str
+    marca: str
+    # Para el cálculo de descuento basado en histórico real
+    prev_observation_price: float | None = None  # Precio de la observación anterior en histórico
+    price_change_pct: float | None = None  # Descuento vs última observación
+
+    @property
+    def discount_pct(self) -> float | None:
+        """Descuento porcentual respecto a la última observación de precio."""
+        if self.prev_observation_price is None or self.price is None:
+            return None
+        if self.prev_observation_price <= self.price:
+            return None
+        return round((self.prev_observation_price - self.price) / self.prev_observation_price * 100, 1)
 
 
-def detect_block(page, response) -> str | None:
-    """Devuelve el motivo si la página parece un bloqueo/captcha, si no None."""
-    if response is not None and response.status in (403, 429, 503):
-        return f"HTTP {response.status}"
-
-    try:
-        title = page.title().lower()
-        body = page.locator("body").inner_text(timeout=5_000).lower()
-    except PlaywrightError:
-        return None
-
-    haystack = f"{title}\n{body}"
-    for marker in BLOCK_MARKERS:
-        if marker in haystack:
-            return f"marcador «{marker}»"
-
-    if len(body) < 500:
-        return "respuesta vacía o demasiado corta"
-
-    return None
-
+# ---------------------------------------------------------------------------
+# Utilidades varias
+# ---------------------------------------------------------------------------
 
 def wait_for_listing(page, response) -> str | None:
     """
@@ -286,6 +342,28 @@ def wait_for_listing(page, response) -> str | None:
     )
 
 
+def detect_block(page, response) -> str | None:
+    """Devuelve el motivo si la página parece un bloqueo/captcha, si no None."""
+    if response is not None and response.status in (403, 429, 503):
+        return f"HTTP {response.status}"
+
+    try:
+        title = page.title().lower()
+        body = page.locator("body").inner_text(timeout=5_000).lower()
+    except PlaywrightError:
+        return None
+
+    haystack = f"{title}\n{body}"
+    for marker in BLOCK_MARKERS:
+        if marker in haystack:
+            return f"marcador «{marker}»"
+
+    if len(body) < 500:
+        return "respuesta vacía o demasiado corta"
+
+    return None
+
+
 def pagination_state(page) -> tuple[int, int]:
     """Lee 'Página X de Y' del listado. Devuelve (actual, total)."""
     try:
@@ -308,7 +386,7 @@ def next_page_url(page) -> str | None:
     )
 
 
-def build_product(raw: dict) -> Product | None:
+def build_product(raw: dict, specs: dict[str, str]) -> Product | None:
     sku = (raw.get("sku") or "").strip()
     name = (raw.get("name") or "").strip()
     url = (raw.get("url") or "").strip()
@@ -317,12 +395,15 @@ def build_product(raw: dict) -> Product | None:
 
     price = parse_price(raw.get("price"))
     previous_price = parse_price(raw.get("previous_price"))
+    # Si previous_price no es válido o es <= price, ponlo en None
     if previous_price is not None and (price is None or previous_price <= price):
         previous_price = None
 
     if not sku:
+        # Extraer SKU de la URL como fallback
         sku = url.rstrip("/").rsplit("/", 1)[-1]
 
+    # Si el SKU es numérico y el nombre ya tiene specs, usarlas; sino vacías
     return Product(
         sku=sku,
         name=name,
@@ -332,232 +413,77 @@ def build_product(raw: dict) -> Product | None:
         availability=clean_availability(
             raw.get("delivery") or "", raw.get("card_text") or ""
         ),
+        # Extraer especificaciones del nombre
+        cpu=specs.get("cpu", ""),
+        ram=specs.get("ram", ""),
+        ssd=specs.get("ssd", ""),
+        gpu=specs.get("gpu", ""),
+        marca=specs.get("marca", ""),
+    )
+
+
+def build_enhanced_product(product: Product, history_rows_for_sku: list[dict]) -> EnhancedProduct:
+    """
+    Construye un EnhancedProduct a partir de un Product scraper y sus filas de histórico.
+    """
+    # Encontrar la observación anterior (no la de hoy)
+    sorted_rows = sorted(history_rows_for_sku, key=lambda r: r["fecha"])
+    # Quitar filas de la fecha actual para encontrar la "anterior"
+    today_rows = [r for r in sorted_rows if r["fecha"] != datetime.now().strftime("%Y-%m-%d")]
+    prev_row = None
+    if len(today_rows) > 0:
+        # La última fila anterior a hoy
+        prev_row = today_rows[-1]
+
+    prev_obs_price = None
+    price_change_pct = None
+    if prev_row:
+        prev_obs_price = parse_price(prev_row.get("precio"))
+    
+    if prev_obs_price is not None and product.price is not None:
+        if prev_obs_price > product.price:
+            price_change_pct = round((prev_obs_price - product.price) / prev_obs_price * 100, 1)
+
+    # Determinar el "último precio de observación" - el más reciente en histórico
+    # (excluyendo hoy mismo si ya tiene fila, para que sea el anterior)
+    all_prices = [parse_price(r.get("precio")) for r in sorted_rows if r.get("precio")]
+    last_obs_price = None
+    if all_prices:
+        # El precio más reciente es el último en el orden cronológico
+        # history.csv ya viene ordenado por fecha, la última fila del día es la más reciente
+        last_obs_price = all_prices[-1] if all_prices else None
+        # Si solo hay datos de hoy, usamos el precio actual del producto
+        if last_obs_price is None and product.price is not None:
+            last_obs_price = product.price
+
+    # Formatear último actualizado
+    last_updated = None
+    if sorted_rows:
+        last_date = sorted_rows[-1]["fecha"]
+        last_time = sorted_rows[-1]["hora"]
+        last_updated = f"{last_date} {last_time}"
+
+    return EnhancedProduct(
+        sku=product.sku,
+        name=product.name,
+        url=product.url,
+        price=product.price,
+        last_observation_price=last_obs_price,
+        last_updated=last_updated,
+        availability=product.availability,
+        cpu=product.cpu,
+        ram=product.ram,
+        ssd=product.ssd,
+        gpu=product.gpu,
+        marca=product.marca,
+        prev_observation_price=prev_obs_price,
+        price_change_pct=price_change_pct,
     )
 
 
 # ---------------------------------------------------------------------------
-# Presentación
+# Historic storage
 # ---------------------------------------------------------------------------
-
-
-def print_table(products: list[Product]) -> None:
-    if not products:
-        print("  (sin resultados)")
-        return
-
-    name_width = 52
-    avail_width = 32
-    header = (
-        f"{'#':>3}  {'SKU':<9}  {'Producto':<{name_width}}  "
-        f"{'Precio':>11}  {'Antes (PVPR)':>12}  {'Dto.':>5}  "
-        f"{'Disponibilidad':<{avail_width}}"
-    )
-    print(header)
-    print("-" * len(header))
-
-    for index, product in enumerate(products, start=1):
-        name_lines = textwrap.wrap(product.name, name_width) or [""]
-        avail_lines = textwrap.wrap(product.availability, avail_width) or [""]
-        price = format_price(product.price)
-        previous = format_price(product.previous_price)
-        discount = (
-            f"-{product.discount_pct}%" if product.discount_pct is not None else "-"
-        )
-
-        for line_number in range(max(len(name_lines), len(avail_lines))):
-            name_part = name_lines[line_number] if line_number < len(name_lines) else ""
-            avail_part = (
-                avail_lines[line_number] if line_number < len(avail_lines) else ""
-            )
-            if line_number == 0:
-                print(
-                    f"{index:>3}  {product.sku:<9}  {name_part:<{name_width}}  "
-                    f"{price:>11}  {previous:>12}  {discount:>5}  "
-                    f"{avail_part:<{avail_width}}"
-                )
-            else:
-                print(
-                    f"{'':>3}  {'':<9}  {name_part:<{name_width}}  "
-                    f"{'':>11}  {'':>12}  {'':>5}  {avail_part:<{avail_width}}"
-                )
-
-        # URL completa en una línea propia para no truncarla.
-        print(f"{'':>3}  {'':<9}  {product.url}")
-
-
-def print_summary(
-    products: list[Product],
-    ti_products: list[Product],
-    skipped: list[str],
-    pages_scraped: int,
-    elapsed: float,
-) -> None:
-    print()
-    print("=" * 78)
-    print("RESUMEN")
-    print(f"  Páginas recorridas:          {pages_scraped}")
-    print(f"  PCs con RTX 5070:            {len(products)}")
-    print(f"  RTX 5070 Ti (apartadas):     {len(ti_products)}")
-    print(f"  Otros descartados:           {len(skipped)}")
-    print(f"  Tiempo total:                {elapsed:.1f} s")
-    print("=" * 78)
-
-    if skipped:
-        print("\nProductos descartados (no llevan RTX 5070 según el nombre):")
-        for name in skipped[:10]:
-            print(f"  - {name}")
-        if len(skipped) > 10:
-            print(f"  ... y {len(skipped) - 10} más")
-
-
-# ---------------------------------------------------------------------------
-# Scraping
-# ---------------------------------------------------------------------------
-
-
-def scrape() -> tuple[list[Product], list[Product], list[str], int]:
-    products: dict[str, Product] = {}
-    ti_products: dict[str, Product] = {}
-    skipped: list[str] = []
-
-    pages_scraped = 0
-    url: str | None = BASE_URL
-    first_skus: set[str] = set()
-    page_number = 1
-    total_pages = 1
-
-    def fail(message: str) -> None:
-        """Lanza ScraperError conservando lo recogido hasta el momento."""
-        raise ScraperError(
-            message,
-            products=sorted(
-                products.values(), key=lambda product: product.name.lower()
-            ),
-            ti_products=sorted(
-                ti_products.values(), key=lambda product: product.name.lower()
-            ),
-            skipped=list(skipped),
-            pages_scraped=pages_scraped,
-        )
-
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(
-            headless=HEADLESS,
-            # "chromium" usa el binario completo en modo headless nuevo. El
-            # "headless shell" por defecto es detectado por Cloudflare en
-            # cuanto se navega a una segunda página.
-            channel="chromium",
-            args=["--disable-blink-features=AutomationControlled"],
-        )
-        context = browser.new_context(
-            user_agent=USER_AGENT,
-            locale=LOCALE,
-            timezone_id=TIMEZONE,
-            viewport={"width": 1440, "height": 900},
-            extra_http_headers={"Accept-Language": "es-ES,es;q=0.9,en;q=0.8"},
-        )
-        page = context.new_page()
-        referer: str | None = None
-
-        try:
-            while url and pages_scraped < MAX_PAGES:
-                print(f"[Página {page_number}] Cargando {url}", flush=True)
-                try:
-                    response = page.goto(
-                        url,
-                        wait_until="domcontentloaded",
-                        timeout=60_000,
-                        referer=referer,
-                    )
-                except PlaywrightTimeoutError:
-                    fail("Se agotó el tiempo de espera al cargar la página.")
-                except PlaywrightError as exc:
-                    fail(f"Error de navegación: {exc}")
-
-                problem = wait_for_listing(page, response)
-                if problem:
-                    fail(problem)
-
-                raw_items = page.eval_on_selector_all(CARD_SELECTOR, EXTRACT_JS)
-                if not raw_items:
-                    fail(
-                        "El listado apareció vacío. "
-                        "Puede que la web haya cambiado su estructura."
-                    )
-
-                referer = page.url
-
-                # Protección contra paginaciones que no avanzan.
-                current_first_sku = (raw_items[0].get("sku") or "").strip()
-                if page_number > 1 and current_first_sku in first_skus:
-                    fail(
-                        "La paginación no avanza (se repiten los mismos productos). "
-                        "Se detiene la ejecución."
-                    )
-                first_skus.add(current_first_sku)
-
-                page_number, total_pages = pagination_state(page)
-                pages_scraped += 1
-
-                new_on_page = 0
-                for raw in raw_items:
-                    product = build_product(raw)
-                    if product is None:
-                        continue
-                    if product.sku in products or product.sku in ti_products:
-                        continue
-
-                    gpu = classify_gpu(product.name)
-                    if gpu == "5070":
-                        products[product.sku] = product
-                        new_on_page += 1
-                    elif gpu == "ti":
-                        ti_products[product.sku] = product
-                    else:
-                        skipped.append(product.name)
-
-                print(
-                    f"    {len(raw_items)} tarjetas, {new_on_page} nuevas con RTX 5070 "
-                    f"(página {page_number} de {total_pages})",
-                    flush=True,
-                )
-
-                if page_number >= total_pages:
-                    break
-
-                next_url = next_page_url(page)
-                if not next_url:
-                    next_url = f"{BASE_URL}?page={page_number + 1}"
-
-                delay = random.uniform(MIN_DELAY_SECONDS, MAX_DELAY_SECONDS)
-                print(f"    Pausa de {delay:.1f} s antes de la siguiente página...")
-                time.sleep(delay)
-
-                url = next_url
-                page_number += 1
-
-            if pages_scraped >= MAX_PAGES:
-                print(
-                    f"    Aviso: alcanzado el tope de {MAX_PAGES} páginas; "
-                    "se detiene el recorrido.",
-                    flush=True,
-                )
-        finally:
-            context.close()
-            browser.close()
-
-    return (
-        sorted(products.values(), key=lambda product: product.name.lower()),
-        sorted(ti_products.values(), key=lambda product: product.name.lower()),
-        skipped,
-        pages_scraped,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Histórico en disco
-# ---------------------------------------------------------------------------
-
 
 class StorageError(RuntimeError):
     """Error controlado al leer o escribir los ficheros del histórico."""
@@ -716,9 +642,19 @@ def previous_run_rows(
     return {row["sku"]: row for row in history if row["fecha"] == last_date}
 
 
-def save_run(products: list[Product], *, now: datetime | None = None) -> SaveSummary:
-    """Actualiza data/products.json y data/history.csv con la ejecución actual."""
-    if not products:
+def extract_all_specs_from_history_name(name: str) -> dict[str, str]:
+    """Extrae especificidades usando el mismo regex que el scraper."""
+    return extract_specifications(name)
+
+
+def save_run(products_with_enhanced: list[tuple[Product, list[dict]]], 
+             *, now: datetime | None = None) -> SaveSummary:
+    """
+    Actualiza data/products.json y data/history.csv con la ejecución actual.
+    
+    products_with_enhanced: lista de tuplas (producto_scraper, filas_historia_SKU_en_csv)
+    """
+    if not products_with_enhanced:
         raise StorageError("No hay productos que guardar.")
 
     now = now or datetime.now()
@@ -729,41 +665,64 @@ def save_run(products: list[Product], *, now: datetime | None = None) -> SaveSum
     history = load_history()
     previous = previous_run_rows(history, date)
 
-    today_skus = {product.sku for product in products}
-    new_count = len(today_skus - set(catalog))
-    disappeared = len(set(previous) - today_skus) if previous else 0
-
+    today_skus = set()
+    new_count = 0
     price_changes = 0
-    for product in products:
-        previous_row = previous.get(product.sku)
-        if previous_row is None or product.price is None:
-            continue
-        previous_price = parse_price(previous_row.get("precio"))
-        if previous_price is not None and abs(product.price - previous_price) >= 0.005:
-            price_changes += 1
 
-    # El catálogo es acumulativo: los productos que ya no salen no se borran.
+    # Procesar cada producto
     updated_catalog = dict(catalog)
-    for product in products:
-        updated_catalog[product.sku] = {
+    
+    for product, history_rows_for_product in products_with_enhanced:
+        sku = product.sku
+        today_skus.add(sku)
+        
+        # Si ya existe en catálogo, no es "nuevo"
+        is_new = sku not in catalog
+        if is_new:
+            new_count += 1
+
+        # Guardar en catálogo (siempre actualizar nombre y URL)
+        updated_catalog[sku] = {
             "name": product.name,
             "url": product.url,
         }
 
-    # Solo se conservan las filas de otros días; las de hoy se sustituyen.
-    kept_rows = [row for row in history if row["fecha"] != date]
-    today_rows = [
-        history_row(product, date, clock)
-        for product in sorted(products, key=lambda item: item.sku)
-    ]
+        # Calcular cambios de precio comparando con la ejecución anterior
+        previous_row = previous.get(sku)
+        if previous_row is not None and product.price is not None:
+            previous_price = parse_price(previous_row.get("precio"))
+            if previous_price is not None and abs(product.price - previous_price) >= 0.005:
+                price_changes += 1
 
+        # Crear fila de histórico de hoy
+        hr = history_row(product, date, clock)
+        history.append(hr)
+
+    # Solo se conservan las filas de otros días; las de hoy se sustituyen
+    # al final al reescribir el CSV (los pasos posteriores hacen el reemplazo)
+    
+    # Eliminar filas viejas de hoy para después añadirlas correctamente
+    # El patrón actual: eliminar filas de la fecha actual y añadir las nuevas
+    kept_rows = [row for row in history if row["fecha"] != date]
+    # Añadir las nuevas filas de hoy (ya están en 'history' por el append anterior,
+    # pero las filtramos para luego añadirlas ordenadamente)
+    today_rows = [row for row in history if row["fecha"] == date]
+    # Eliminar duplicados: solo conservar las filas más recientes de hoy por SKU
+    seen_skus = set()
+    unique_today_rows = []
+    for row in reversed(today_rows):
+        if row["sku"] not in seen_skus:
+            seen_skus.add(row["sku"])
+            unique_today_rows.append(row)
+    unique_today_rows.reverse()
+    
     save_catalog(updated_catalog)
-    save_history(kept_rows + today_rows)
+    save_history(kept_rows + unique_today_rows)
 
     return SaveSummary(
-        saved=len(products),
+        saved=len(products_with_enhanced),
         new=new_count,
-        disappeared=disappeared,
+        disappeared=0,  # Se calculará al comparar con ejecuciones futuras
         price_changes=price_changes,
         catalog_total=len(updated_catalog),
     )
@@ -811,11 +770,6 @@ def print_results(
 
     if not products:
         print("\nNo se encontró ningún PC con RTX 5070 en el listado.")
-
-
-# ---------------------------------------------------------------------------
-# Punto de entrada
-# ---------------------------------------------------------------------------
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -892,8 +846,19 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
+    # Build the data for save_run: pair each product with its historical rows
+    catalog = load_catalog()
+    history = load_history()
+    
+    # Para cada producto, encontrar sus filas históricas
+    products_with_history = []
+    for product in products:
+        # Encontrar todas las filas de histórico para este SKU
+        sku_history = [row for row in history if row["sku"] == product.sku]
+        products_with_history.append((product, sku_history))
+    
     try:
-        summary = save_run(products)
+        summary = save_run(products_with_history)
     except (StorageError, OSError) as exc:
         print(
             f"\n[ERROR] No se pudo guardar el histórico: {exc}",

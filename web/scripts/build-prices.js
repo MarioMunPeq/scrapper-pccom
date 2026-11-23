@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 /** 
  * Build script para web/ - Genera web/public/data/prices.json
- * LEYE SIEMPRE data/history.csv y data/products.json
+ * Lee data/history.csv y data/products.json desde la raíz del repositorio.
+ * Genera web/public/data/prices.json con la serie completa de precios por SKU y estadísticas.
  * NUNCA inventa productos - solo usa datos reales
- * Usa precio_anterior de history.csv como previousPrice (PVPR real)
- * Usa descuento de history.csv como discount real
- * Si hay < 3 días de historial, muestra puntos reales con aviso
+ * Usa TODAS las observaciones del histórico para min/max/promedio
+ * Si hay < 3 días de historial, muestra datos reales con aviso
  * Si data/ vacío o inexistente, muestra estado vacío
- */ 
+ */
 
 const fs = require('fs')
 const path = require('path')
@@ -35,12 +35,10 @@ const ATTR_REGEX = {
   cpu: /(Intel|AMD|Core|Ryzen)\s+\w+(?:\s+\w+)?/gi,
   ram: /(\d+)\s*GB\s*RAM/gi,
   ssd: /(\d+)\s*TB\s*SSD|(\d+)\s*GB\s*SSD/gi,
-  marca: /(PcCom|Vibox|PCM|Aeon|NeoPC|Gamer|Gaming|Centrum)/gi,
+  marca: /(PcCom|Vibox|PCM|Aeon|NeoPC|Gamer|Gaming|Centrum|IBUYPOWER|DeepGaming|NitroPC|Tecnowake|Epical-q)/gi,
 }
 
-/** 
- * Extrae atributos del nombre del producto usando regex 
- */ 
+/** Extrae atributos del nombre del producto */
 function extractAttributes(name) {
   const result = { cpu: '', ram: '', ssd: '', marca: '' }
   const matches = name.match(ATTR_REGEX)
@@ -56,9 +54,22 @@ function extractAttributes(name) {
   return result
 }
 
-/** 
- * Parses un precio string a número (quita €, separadores de miles) 
- */ 
+/** Detecta si la fecha es un hito conocido y devuelve la etiqueta */
+function isHito(date) {
+  const d = new Date(date)
+  if (d.getDate() === BLACK_FRIDAY.getDate() && d.getMonth() === BLACK_FRIDAY.getMonth())
+    return 'Black Friday (27/11)'
+  if (d.getDate() === CYBER_MONDAY.getDate() && d.getMonth() === CYBER_MONDAY.getMonth())
+    return 'Cyber Monday (30/11)'
+  if (d.getDate() === CHRISTMAS.getDate() && d.getMonth() === CHRISTMAS.getMonth())
+    return 'Navidad (25/12)'
+  if (d.getDate() === REYES.getDate() && d.getMonth() === REYES.getMonth())
+    return 'Reyes (6/1)'
+  if (d >= JANUARY_SALES_START) return 'Rebajas enero'
+  return null
+}
+
+/** Parses un precio string a número (quita €, separadores de miles) */
 function parsePrice(value) {
   if (value === null || value === undefined || value === '') return null
   const text = String(value)
@@ -102,23 +113,6 @@ function parseCSV(content) {
     rows.push(row)
   }
   return rows
-}
-
-/** 
- * Detecta si la fecha es un hito conocido y devuelve la etiqueta 
- */ 
-function isHito(date) {
-  const d = new Date(date)
-  if (d.getDate() === BLACK_FRIDAY.getDate() && d.getMonth() === BLACK_FRIDAY.getMonth())
-    return 'Black Friday (27/11)'
-  if (d.getDate() === CYBER_MONDAY.getDate() && d.getMonth() === CYBER_MONDAY.getMonth())
-    return 'Cyber Monday (30/11)'
-  if (d.getDate() === CHRISTMAS.getDate() && d.getMonth() === CHRISTMAS.getMonth())
-    return 'Navidad (25/12)'
-  if (d.getDate() === REYES.getDate() && d.getMonth() === REYES.getMonth())
-    return 'Reyes (6/1)'
-  if (d >= JANUARY_SALES_START) return 'Rebajas enero'
-  return null
 }
 
 /* --- Lógica principal --- */
@@ -183,8 +177,10 @@ for (const sku of allSkus) {
     continue
   }
 
-  // Filtrar rows de histórico para este SKU (todos los registros reales)
-  const skuRows = historyRows.filter(r => r.sku === sku).sort(function (a, b) { return new Date(a.fecha) - new Date(b.fecha) })
+  // Filtrar rows de histórico para este SKU (todos los registros reales), ordenados por fecha
+  const skuRows = historyRows.filter(r => r.sku === sku).sort(function (a, b) {
+    return new Date(a.fecha) - new Date(b.fecha)
+  })
 
   if (skuRows.length === 0) {
     // SKU en products.json pero sin histórico - incluir con precio actual null
@@ -205,41 +201,80 @@ for (const sku of allSkus) {
       datosReales: true,
       showHistoryNote: false,
       numDiasHistorial: 0,
+      priceSeries: [], //serie temporal para el chart
+      firstPrice: null,
+      lastPrice: null,
     })
     continue
   }
 
-  // Extraer precio actual de la columna 'precio'
-  const currentPrice = parsePrice(skuRows[0].precio) // Usamos la primera (y única) fila
+  // Extraer precio actual: la observación más reciente (última fila al ordenar por fecha ascending)
+  // skuRows ya están ordenados ascending por fecha, así que la última es la más reciente
+  const currentPrice = parsePrice(skuRows[skuRows.length - 1].precio)
 
-  // Usar precio_anterior de history.csv como previousPrice (PVPR real)
-  const previousPrice = parsePrice(skuRows[0].precio_anterior)
+  // Usar la observación anterior a la última para previousPrice y discount
+  // Si hay al menos 2 observaciones, el previousPrice es la penúltima
+  let previousPrice = null
+  let discount = null
+  let priceSeries = []
+  
+  if (skuRows.length >= 2) {
+    previousPrice = parsePrice(skuRows[skuRows.length - 2].precio)
+    // Descuento respecto a la observación anterior (precio real histórico)
+    if (previousPrice !== null && currentPrice !== null && previousPrice > currentPrice) {
+      discount = round((previousPrice - currentPrice) / previousPrice * 100)
+    }
+  } else if (skuRows.length === 1) {
+    // Solo una observación: previousPrice es null, discount es null
+    // Pero podemos usar precio_anterior de la propia fila si existe
+    const singleRow = skuRows[0]
+    const prevFromRow = parsePrice(singleRow.precio_anterior)
+    if (prevFromRow !== null && currentPrice !== null && prevFromRow > currentPrice) {
+      discount = round((prevFromRow - currentPrice) / prevFromRow * 100)
+    }
+  }
 
-  // Usar descuento de history.csv como discount real
-  const discount = skuRows[0].descuento !== undefined && skuRows[0].descuento !== '' 
-    ? parseInt(skuRows[0].descuento, 10) 
-    : null
+  // priceSeries: todas las observaciones de precio a lo largo del tiempo
+  // Ordenadas de más antigua a más reciente para el chart
+  priceSeries = skuRows.map(r => ({
+    fecha: r.fecha,
+    precio: parsePrice(r.precio) || null,
+    precio_anterior: parsePrice(r.precio_anterior) || null,
+    descuento: parseInt(r.descuento, 10) || null,
+  })).filter(s => s.precio !== null)
 
-  // Filtrar rows de histórico para este SKU (todos los registros reales)
-  const prices = skuRows.map(r => parsePrice(r.precio)).filter(p => p !== null)
+  // firstPrice y lastPrice de la serie real
+  const firstPrice = priceSeries.length > 0 ? priceSeries[0].precio : null
+  const lastPrice = priceSeries.length > 0 ? priceSeries[priceSeries.length - 1].precio : null
 
-  // Precios anteriores (PVPR) de la columna 'precio_anterior' - ya tenemos previousPrice arriba
-  // const preciosAnteriores = skuRows.filter(r => r.precio_anterior).map(r => parsePrice(r.precio_anterior)).filter(p => p !== null)
+  // Descount final: usar previousPrice calculado arriba
+  // Si no se pudo calcular, intentar de la última fila completa
+  if (discount === null && priceSeries.length > 0) {
+    // Usar la penúltima observación como referencia de "antes"
+    if (priceSeries.length >= 2) {
+      const prevP = priceSeries[priceSeries.length - 2].precio
+      if (prevP !== null && currentPrice !== null && prevP > currentPrice) {
+        discount = round((prevP - currentPrice) / prevP * 100)
+      }
+    }
+  }
 
-  // Descuentos de la columna 'descuento' - ya tenemos discount arriba
-  // const descuentos = skuRows.filter(r => r.descuento).map(r => {
-  //   const d = parseInt(r.descuento, 10)
-  //   return !isNaN(d) ? d : null
-  // }).filter(d => d !== null)
+  // Min/max histórico sobre TODAS las observaciones
+  const pricesValues = priceSeries.map(s => s.precio).filter(p => p !== null)
+  const minPriceHistorico = pricesValues.length > 0 ? Math.min(...pricesValues) : null
+  const maxPriceHistorico = pricesValues.length > 0 ? Math.max(...pricesValues) : null
 
-  const minPriceHistorico = prices.length > 0 ? Math.min(...prices) : null
-  const maxPriceHistorico = prices.length > 0 ? Math.max(...prices) : null
-  // variation7d: no aplicable con 1 dato, ponemos 0
-  const variation7d = 0
+  // Calcular variation7d basándonos en datos reales
+  // Buscar precios de los últimos 7 días disponibles
+  const variation7d = calculateVariation7d(skuRows, priceSeries)
+  
+  // Total de registros (días con datos)
   const totalRegistros = skuRows.length
 
   // Detectar el hito más reciente
-  const hitoMasRecente = skuRows.filter(r => r.fecha).sort(function (a, b) { return new Date(a.fecha) - new Date(b.fecha) }).reverse()[0]
+  const hitoMasRecente = skuRows.filter(r => r.fecha).sort(function (a, b) {
+    return new Date(a.fecha) - new Date(b.fecha)
+  }).reverse()[0]
   const hitoInfo = hitoMasRecente ? isHito(hitoMasRecente.fecha) : null
 
   // Determinar si mostrar nota de historial en construcción
@@ -249,8 +284,8 @@ for (const sku of allSkus) {
     sku,
     name,
     currentPrice,
-    previousPrice, // PVPR real de history.csv
-    discount,      // Descuento real de history.csv
+    previousPrice,
+    discount,      // Descuento real basado en observaciones históricas
     minPriceHistorico,
     maxPriceHistorico,
     variation7d,
@@ -260,8 +295,11 @@ for (const sku of allSkus) {
     esMuestra: false,
     motivoMuestra: '',
     datosReales: true,
-    showHistoryNote, // Flag para mostrar "Historial en construcción"
-    numDiasHistorial, // Número real de días de historial
+    showHistoryNote,
+    numDiasHistorial,
+    priceSeries, // Serie temporal completa para el chart
+    firstPrice,
+    lastPrice,
   })
 }
 
@@ -279,3 +317,37 @@ console.log(`Generated prices.json con ${pricesData.length} productos (datos rea
 const withNote = pricesData.filter(p => p.showHistoryNote).length
 console.log(` - Productos con historial < 3 días: ${withNote}`)
 console.log(` - Primer SKU: ${pricesData[0]?.sku}, Último SKU: ${pricesData[pricesData.length - 1]?.sku}`)
+
+/** Calcula la variación porcentual en 7 días basándose en datos reales */
+function calculateVariation7d(skuRows, priceSeries) {
+  if (priceSeries.length < 2) return 0
+  
+  // Obtener la última precio de la serie
+  const lastPrice = priceSeries[priceSeries.length - 1].precio
+  if (lastPrice === null) return 0
+  
+  // Buscar el precio hace 7 días
+  // Las filas de history.csv tienen fechas, buscamos la fecha hace aproximadamente 7 días
+  const today = new Date()
+  const sevenDaysAgo = new Date(today)
+  sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7)
+  const sevenDaysAgoStr = sevenDaysAgo.toISOString().split('T')[0]
+  
+  // Encontrar la observación más cercana a hace 7 días
+  let price7DaysAgo = null
+  for (const row of skuRows.reverse()) {
+    const rowDate = new Date(row.fecha)
+    if (rowDate <= sevenDaysAgo) {
+      price7DaysAgo = parsePrice(row.precio)
+      break
+    }
+  }
+  
+  if (price7DaysAgo === null || lastPrice === null || price7DaysAgo === lastPrice) return 0
+  
+  return round((lastPrice - price7DaysAgo) / price7DaysAgo * 100)
+}
+
+function round(value) {
+  return Math.round(value * 100) / 100
+}
