@@ -7,21 +7,21 @@ on:
       - web/**
   # Ejecución manual desde la pestaña Actions
   workflow_dispatch:
-  # Espera a que termine el workflow de scrape (para deploy con datos frescos)
+  # Espera a que termine el workflow de scrape (los commits del bot no disparan push)
   workflow_run:
     workflows: ["pc-price-tracker"]
     types:
       - completed
-    # Si el scraper falló (exit code != 0), aún así deploy con datos existentes
 
 concurrency:
-  # Evita despliegues simultáneos; el nuevo reemplaza al anterior
+  # Evita que se solapen despliegues; el nuevo reemplaza al anterior
   group: deploy-web-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
-  contents: write
-  id-token: write # necesario para actions/deploy-pages
+  contents: read
+  pages: write
+  id-token: write
 
 jobs:
   build-and-deploy:
@@ -33,7 +33,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Node.js
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
           node-version: '20'
 
@@ -44,13 +44,12 @@ jobs:
         # Este script lee los datos y genera web/public/data/prices.json
         # Siempre se ejecuta, aunque el scraper haya fallado, para asegurar
         # que los datos estén actualizados
-        run: |
-          set -e
-          npm run build 2>&1 || echo "Advertencia: el build tuvo problemas, se usarán datos existentes"
+        run: npm run build
 
-      - name: Deploy a GitHub Pages
-        uses: actions/deploy-pages@v4
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
         with:
           folder: web/dist
-          # Si el folder dist no existe (fallo grave), deploy fallará gracefully
-          # pero el workflow no se marcará como failed por eso
+
+      - name: Deploy to GitHub Pages
+        uses: actions/deploy-pages@v4

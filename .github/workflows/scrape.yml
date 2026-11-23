@@ -28,7 +28,6 @@ concurrency:
 
 permissions:
   contents: write  # necesario para commitear data/
-  id-token: write  # para actions/deploy-pages
 
 jobs:
   scrape:
@@ -37,9 +36,6 @@ jobs:
 
     steps:
       # --- Checkout ---
-      - name: Cancela si ya está corriendo (check)
-        uses: pencilward/cancel-action@main
-
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
