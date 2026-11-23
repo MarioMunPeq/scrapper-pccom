@@ -1,0 +1,22 @@
+[
+  {
+    "sku": "10650846",
+    "name": "PC Test RTX 5070",
+    "currentPrice": 2350,
+    "previousPrice": 2399,
+    "discount": 38,
+    "minPriceHistorico": 2350,
+    "maxPriceHistorico": 2489,
+    "variation7d": -2,
+    "totalRegistros": 3,
+    "attributes": {
+      "cpu": "",
+      "ram": "",
+      "ssd": "",
+      "marca": ""
+    },
+    "hito": null,
+    "esMuestra": false,
+    "motivoMuestra": ""
+  }
+]

@@ -1,9 +1,18 @@
 name: pc-price-tracker
 
 on:
+  # Ejecutar al subir a main (solo en los archivos relevantes)
+  push:
+    branches:
+      - main
+    paths:
+      - scraper.py
+      - requirements.txt
+      - .github/workflows/scrape.yml
+  # Ejecutar diario a las 11:00 UTC
   schedule:
-    # Todos los días a las 11:00 UTC
     - cron: "0 11 * * *"
+  # Permitir ejecución manual desde la pestaña Actions
   workflow_dispatch:
     # Permitir ejecución manual desde la pestaña Actions
     inputs:
@@ -19,6 +28,7 @@ concurrency:
 
 permissions:
   contents: write  # necesario para commitear data/
+  id-token: write  # para actions/deploy-pages
 
 jobs:
   scrape:
@@ -85,10 +95,12 @@ jobs:
             echo "data/ folder does not exist (first run or --no-save)"
           fi
 
-      # --- Si hay cambios, commitear y push ---
-      - name: Commit data/ changes
-        if: steps.data_changes.outputs.has_changes == 'true'
+      # --- Si hay cambios, commitear y push (solo si el scraper tuvo éxito) ---
+      - name: Commit data/ changes (solo si scraper_ok)
+        if: steps.data_changes.outputs.has_changes == 'true' && env.SCRAPE_EXIT_CODE == '0'
         run: |
+          # Hacemos pull --rebase para evitar conflictos con otros commits
+          git pull --rebase
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add data/

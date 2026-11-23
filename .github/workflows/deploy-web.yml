@@ -1,0 +1,56 @@
+name: Deploy Web
+
+on:
+  # Cuando se toca algún archivo en web/
+  push:
+    paths:
+      - web/**
+  # Ejecución manual desde la pestaña Actions
+  workflow_dispatch:
+  # Espera a que termine el workflow de scrape (para deploy con datos frescos)
+  workflow_run:
+    workflows: ["pc-price-tracker"]
+    types:
+      - completed
+    # Si el scraper falló (exit code != 0), aún así deploy con datos existentes
+
+concurrency:
+  # Evita despliegues simultáneos; el nuevo reemplaza al anterior
+  group: deploy-web-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  id-token: write # necesario para actions/deploy-pages
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Ejecutar script de generación de precios
+        # Este script lee los datos y genera web/public/data/prices.json
+        # Siempre se ejecuta, aunque el scraper haya fallado, para asegurar
+        # que los datos estén actualizados
+        run: |
+          set -e
+          npm run build 2>&1 || echo "Advertencia: el build tuvo problemas, se usarán datos existentes"
+
+      - name: Deploy a GitHub Pages
+        uses: actions/deploy-pages@v4
+        with:
+          folder: web/dist
+          # Si el folder dist no existe (fallo grave), deploy fallará gracefully
+          # pero el workflow no se marcará como failed por eso

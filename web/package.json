@@ -1,0 +1,9 @@
+{
+  "name": "pc-price-tracker-web",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": {
+    "build": "node web/scripts/build-prices.js && vite build"
+  },
+  "dependencies": {}
+}
