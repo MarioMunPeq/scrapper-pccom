@@ -217,11 +217,6 @@ export default function App() {
   // Calcular el total de páginas (ceil division)
   const totalPages = Math.ceil(totalPCs / ITEMS_PER_PAGE) || 1
 
-  // Calcular el rango de índices para la página actual
-  const startIndex = (currentPage - 1) * ITEMS_PER_PAGE
-  const endIndex = startIndex + ITEMS_PER_PAGE
-  // Usamos 'currentPage' desde el closure - necesito añadirlo al estado
-  
   // Paginación state
   const [currentPage, setCurrentPage] = useState(1)
 
