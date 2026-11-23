@@ -13,7 +13,7 @@ const fs = require('fs')
 const path = require('path')
 
 // Rutas del repositorio (usando rutas relativas al script)
-const SCRIPT_DIR = path.resolve(path.dirname(__FILE__))
+const SCRIPT_DIR = path.resolve(__dirname)
 const REPO_ROOT = path.resolve(SCRIPT_DIR, '..', '..')
 const DATA_DIR = path.join(REPO_ROOT, 'data')
 const PUBLIC_DIR = path.resolve(SCRIPT_DIR, '..', 'public')
