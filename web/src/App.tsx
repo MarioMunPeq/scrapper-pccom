@@ -2,56 +2,56 @@ import React, { useState, useEffect } from 'react'
 
 import './style.css'
 
-// Datos de ejemplo (se reemplazarán con los reales en prebuild)
-const initialPrices: any[] = [
-  {
-    sku: '11011276',
-    name: 'PcCom Imperial AMD Ryzen 7 5700X / RTX 5070 / Windows 11 Home',
-    currentPrice: 1799.0,
-    previousPrice: 2299.0,
-    discount: 22,
-    attributes: { cpu: '', ram: '', ssd: '', marca: 'PcCom' },
-    hito: null,
-    esMuestra: true,
-    motivoMuestra: 'Histórico con menos de 3 días de datos.',
-  },
-]
+// SIN initialPrices - NUNCA datos inventados ni de reserva
 
 function usePrices() {
-  const [prices, setPrices] = useState(initialPrices)
-  const [showSampleWarning, setShowSampleWarning] = useState(true)
+  const [prices, setPrices] = useState<any[]>([])
+  const [showError, setShowError] = useState(false)
+  const [errorMessage, setErrorMessage] = useState<string>('')
 
   useEffect(() => {
     const loadPrices = async () => {
       try {
-        const res = await fetch('/data/prices.json')
-        const data: any[] = await res.json()
-        setPrices(data)
+        // Usar import.meta.env.BASE_URL para respetar la base /scrapper-pccom/ del GitHub Pages
+        const baseUrl = import.meta.env.BASE_URL
+        const res = await fetch(baseUrl + 'data/prices.json')
         
-        // Lógica de decisión de datos (NUNCA inventar productos):
-        // 1. Si hay productos reales (datosReales=true), SIEMPRE usarlos
-        // 2. Si data/ vacío o inexistente, mostrar estado vacío
-        const hasRealProducts = data.length > 0 && data.some(function (p: any) { return p.datosReales })
-        const dataDirExists = true // Se asume que data/ existe si llegamos aquí
-        
-        if (!dataDirExists) {
-          // data/ no existe - estado vacío
-          setShowSampleWarning(false)
-          return
+        if (!res.ok) {
+          throw new Error('Error ' + res.status + ' al cargar prices.json')
         }
         
-        // Si hay productos reales, siempre se muestran (aunque tengan < 3 días)
-        // El aviso "Historial en construcción" se mostrará por producto individual
-        setShowSampleWarning(false) // Ocultar aviso de muestra siempre (no hay datos falsos)
-      } catch (e) {
-        console.warn('No se pudo cargar prices.json', e)
-        setShowSampleWarning(true)
+        const data: any[] = await res.json()
+        
+        // Verificar si los datos son válidos
+        if (!Array.isArray(data)) {
+          throw new Error('Formato de datos inválido: expected array')
+        }
+        
+        // Mostrar error si no hay productos reales y hay aviso de muestra
+        const hasRealProducts = data.length > 0 && data.some(function (p: any) { return p.datosReales })
+        
+        if (hasRealProducts) {
+          setPrices(data)
+          setShowError(false)
+        } else if (data.length === 0) {
+          // data/ vacío - mostrar estado vacío
+          setShowError(false)
+          setPrices([]) // explícitamente vacío
+        } else {
+          // Hay productos pero sin datos reales (caso inesperado)
+          throw new Error('Datos disponibles pero sin información real')
+        }
+      } catch (e: any) {
+        console.warn('Error cargando prices.json', e)
+        setShowError(true)
+        setErrorMessage(e.message || 'Error desconocido cargando los datos')
+        // No establecer prices para mostrar estado de error
       }
     }
     loadPrices()
   }, [])
 
-  return { prices, showSampleWarning }
+  return { prices, showError, errorMessage }
 }
 
 function useFilters(prices: any[]) {
@@ -175,7 +175,7 @@ function PriceCard({ p }: any) {
   )
 }
 
-// Ya no usamos SampleWarning since never show fake data
+// Ya no usamos SampleWarning - NUNCA datos de ejemplo
 function SampleWarning() {
   return React.createElement(
     'div',
@@ -198,7 +198,7 @@ function formatoEntero(num: number): string {
 const ITEMS_PER_PAGE = 48
 
 export default function App() {
-  const { prices, showSampleWarning } = usePrices()
+  const { prices, showError, errorMessage } = usePrices()
   const {
     search, setSearch,
     minPrice, setMinPrice,
@@ -213,15 +213,6 @@ export default function App() {
   // Filtrar solo productos con precios válidos para cálculos
   const validPrices = prices.filter(function (p: any) { return p.currentPrice != null })
   const totalPCs = validPrices.length
-  const precioMedio = totalPCs > 0
-    ? (validPrices.reduce(function (sum: number, p: any) { return sum + p.currentPrice }, 0) / totalPCs).toFixed(0)
-    : '0'
-  const precioMaximo = validPrices.length > 0 ? Math.max.apply(Math, validPrices.map(function (p: any) { return p.currentPrice })) || 0 : 0
-  const precioMinimo = validPrices.length > 0 ? Math.min.apply(Math, validPrices.map(function (p: any) { return p.currentPrice }) ) || 0 : 0
-  const maximaRebaja = validPrices.length > 0 ? Math.max.apply(Math, validPrices.map(function (p: any) { return p.discount || 0 })) : 0
-
-  // Paginación state
-  const [currentPage, setCurrentPage] = useState(1)
 
   // Calcular el total de páginas (ceil division)
   const totalPages = Math.ceil(totalPCs / ITEMS_PER_PAGE) || 1
@@ -229,20 +220,21 @@ export default function App() {
   // Calcular el rango de índices para la página actual
   const startIndex = (currentPage - 1) * ITEMS_PER_PAGE
   const endIndex = startIndex + ITEMS_PER_PAGE
-  const pageItems = validPrices.slice(startIndex, endIndex)
+  // Usamos 'currentPage' desde el closure - necesito añadirlo al estado
+  
+  // Paginación state
+  const [currentPage, setCurrentPage] = useState(1)
+
+  // Calcular el rango de índices para la página actual
+  const startIdx = (currentPage - 1) * ITEMS_PER_PAGE
+  const endIdx = startIdx + ITEMS_PER_PAGE
+  const pageItems = validPrices.slice(startIdx, endIdx)
 
   // Función para cambiar de página
   const goToPage = function (page: number) {
     // Limitar el número de página entre 1 y totalPages
     const newPage = Math.max(1, Math.min(page, totalPages))
     setCurrentPage(newPage)
-  }
-
-  // Función para calcular el total de resultados aplicando filtros
-  const getFilteredCount = function (): number {
-    // Count all valid prices that match the current filters
-    // Usar el filtered count original
-    return totalPCs
   }
 
   return React.createElement(
@@ -262,27 +254,39 @@ export default function App() {
         React.createElement(
           'div',
           { className: 'kpi' },
-          React.createElement('span', { title: 'Precio medio' }, precioMedio + ' €')
+          React.createElement('span', { title: 'Precio medio' }, precioMedio(totalPCs, validPrices) + ' €')
         ),
         React.createElement(
           'div',
           { className: 'kpi' },
-          React.createElement('span', { title: 'Precio máximo' }, formatoEntero(precioMaximo) + ' €')
+          React.createElement('span', { title: 'Precio máximo' }, formatoEntero(precioMaximo(validPrices)) + ' €')
         ),
         React.createElement(
           'div',
           { className: 'kpi' },
-          React.createElement('span', { title: 'Precio mínimo' }, formatoEntero(precioMinimo) + ' €')
+          React.createElement('span', { title: 'Precio mínimo' }, formatoEntero(precioMinimo(validPrices)) + ' €')
         ),
         React.createElement(
           'div',
           { className: 'kpi' },
-          React.createElement('span', { title: 'Máxima rebaja' }, maximaRebaja + '%')
+          React.createElement('span', { title: 'Máxima rebaja' }, maximaRebaja(validPrices) + '%')
         )
       )
     ),
 
-    // Listado filtrable con paginación
+    // MOSTRAR ERROR SI FALLA EL FETCH
+    showError && React.createElement(
+      'div',
+      { className: 'error-banner' },
+      React.createElement('span', null, 'ERROR'),
+      React.createElement(
+        'p',
+        null,
+        errorMessage
+      )
+    ),
+
+    // LISTADO FILTRABLE CON PAGINACIÓN
     React.createElement(
       'section',
       { className: 'listado', 'aria-label': 'Listado de PCs' },
@@ -346,7 +350,7 @@ export default function App() {
       React.createElement(
         'div',
         { className: 'lista' },
-        // Si no hay productos filtrados
+        // Si todos los precios son nulos/ Vacío
         validPrices.length === 0
           ? React.createElement('p', null, 'No hay datos de precios disponibles. Añade productos a data/products.json y data/history.csv.')
           : // Mostrar productos de la página actual
@@ -361,10 +365,7 @@ export default function App() {
       React.createElement(
         'span',
         { className: 'pagination-info' },
-        'Página '
-        + currentPage
-        + ' de '
-        + totalPages
+        'Página ' + currentPage + ' de ' + totalPages
       ),
       React.createElement(
         'button',
@@ -412,4 +413,25 @@ export default function App() {
       )
     )
   )
+}
+
+// Helpers para KPIs fuera del componente
+function precioMedio(total: number, validPrices: any[]): string {
+  if (total > 0) {
+    const sum = validPrices.reduce(function (s: number, p: any) { return s + p.currentPrice }, 0)
+    return (sum / total).toFixed(0)
+  }
+  return '0'
+}
+
+function precioMaximo(validPrices: any[]): number {
+  return validPrices.length > 0 ? Math.max.apply(Math, validPrices.map(function (p: any) { return p.currentPrice })) || 0 : 0
+}
+
+function precioMinimo(validPrices: any[]): number {
+  return validPrices.length > 0 ? Math.min.apply(Math, validPrices.map(function (p: any) { return p.currentPrice })) || 0 : 0
+}
+
+function maximaRebaja(validPrices: any[]): number {
+  return validPrices.length > 0 ? Math.max.apply(Math, validPrices.map(function (p: any) { return p.discount || 0 })) : 0
 }
