@@ -4,7 +4,23 @@ import './style.css'
 
 // SIN initialPrices - NUNCA datos inventados ni de reserva
 
+// --- DEBUG: Mostrar información de estado en la página ---
+// Esto ayuda a depurar qué sucede cuando la página carga en GitHub Pages
+function useDebug() {
+  const [debugInfo, setDebugInfo] = useState({
+    phase: 'init', // 'init', 'loading', 'loaded', 'error'
+    priceCount: 0,
+    errorMessage: '',
+    showErrorBanner: false,
+  })
+
+  return { debugInfo, setDebugInfo }
+}
+
+// SIN initialPrices - NUNCA datos inventados ni de reserva
+
 function usePrices() {
+  const { debugInfo, setDebugInfo } = useDebug()
   const [prices, setPrices] = useState<any[]>([])
   const [showError, setShowError] = useState(false)
   const [errorMessage, setErrorMessage] = useState<string>('')
@@ -12,6 +28,8 @@ function usePrices() {
   useEffect(() => {
     const loadPrices = async () => {
       try {
+        setDebugInfo(prev => ({ ...prev, phase: 'loading' }))
+        
         // Usar import.meta.env.BASE_URL para respetar la base /scrapper-pccom/ del GitHub Pages
         const baseUrl = import.meta.env.BASE_URL
         const res = await fetch(baseUrl + 'data/prices.json')
@@ -32,9 +50,21 @@ function usePrices() {
         
         if (hasRealProducts) {
           setPrices(data)
+          setDebugInfo({
+            phase: 'loaded',
+            priceCount: data.length,
+            errorMessage: '',
+            showErrorBanner: false,
+          })
           setShowError(false)
         } else if (data.length === 0) {
           // data/ vacío - mostrar estado vacío
+          setDebugInfo({
+            phase: 'loaded',
+            priceCount: 0,
+            errorMessage: '',
+            showErrorBanner: false,
+          })
           setShowError(false)
           setPrices([]) // explícitamente vacío
         } else {
@@ -43,6 +73,12 @@ function usePrices() {
         }
       } catch (e: any) {
         console.warn('Error cargando prices.json', e)
+        setDebugInfo({
+          phase: 'error',
+          priceCount: 0,
+          errorMessage: e.message || 'Error desconocido cargando los datos',
+          showErrorBanner: true,
+        })
         setShowError(true)
         setErrorMessage(e.message || 'Error desconocido cargando los datos')
         // No establecer prices para mostrar estado de error
@@ -51,7 +87,7 @@ function usePrices() {
     loadPrices()
   }, [])
 
-  return { prices, showError, errorMessage }
+  return { prices, showError, errorMessage, debugInfo }
 }
 
 function useFilters(prices: any[]) {
@@ -240,6 +276,17 @@ export default function App() {
   return React.createElement(
     'main',
     { className: 'app' },
+    // DEBUG BANNER: Shows what's happening when page loads (always visible)
+    React.createElement(
+      'div',
+      { className: 'error-banner', style: { marginBottom: '1rem', padding: '0.75rem', background: '#1a1a20', border: '1px solid #ff5f57', color: '#ff5f57' } },
+      React.createElement('span', null, 'DEBUG'),
+      React.createElement(
+        'p',
+        null,
+        `Fase: ${debugInfo.phase} | Productos: ${debugInfo.priceCount}`
+      )
+    ),
     // Header con KPIs
     React.createElement(
       'header',
