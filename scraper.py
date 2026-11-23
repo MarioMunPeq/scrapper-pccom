@@ -204,7 +204,7 @@ def parse_price(value: object) -> float | None:
         text = text.replace(".", "")
     elif text.count(".") == 1 and len(text.rsplit(".", 1)[1]) == 3:
         # 1.799 (separador de miles sin decimales)
-        text = text.replace(".", ")
+        text = text.replace(".", "")
 
     try:
         return float(text)
