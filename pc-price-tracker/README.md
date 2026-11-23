@@ -95,6 +95,52 @@ HISTÓRICO GUARDADO
 
 ## Histórico de precios
 
+## Integración con GitHub Actions
+
+Este proyecto incluye un workflow de GitHub Actions para ejecutar el scraper de forma automática y repetida.
+
+### Activarlo
+
+1. Push o pull request este repositorio (o crear los archivos si es nuevo).
+2. Entra en la pestaña **Actions** del repositorio en github.com.
+3. Deberías ver el workflow **pc-price-tracker**. Si no aparece, haz clic en "I have a .github/workflows" o en "New workflow".
+4. GitHub lo detectará automáticamente por el archivo `.github/workflows/scrape.yml`.
+
+### Primeros pasos después de activarlo
+
+- El workflow se ejecutará **diariamente a las 11:00 UTC** (horario de Madrid en invierno).
+- La primera ejecución creará la carpeta `data/` en el repositorio y poblará `products.json` y `history.csv`.
+- Las ejecuciones posteriores reemplazarán las filas del día actual en `history.csv`, manteniendo solo la última ejecución de cada día.
+
+### Lanzarlo a mano
+
+1. Ve a la pestaña **Actions** en github.com.
+2. Haz clic en el workflow **pc-price-tracker**.
+3. En la parte superior derecha, pulka en **"Run workflow"** (el botón verde).
+4. Opcionalmente, añade un motivo en el campo "Enter a reason for the run".
+5. Pulka en **Run workflow**. La ejecución aparecerá en tiempo real.
+
+### Si Cloudflare bloquea en CI
+
+El workflow está preparado para lidiar con los retos de Cloudflare de la siguiente manera:
+
+- El scraper usa el **Chromium completo** (`playwright install --with-deps chromium`) y el argumento `--disable-blink-features=AutomationControlled`.
+- Si la página devuelve `403`/`429` con la pantalla "Un momento…", el script espera hasta **15 s** a que el reto se resuelva automáticamente. Si no se resuelve, el job de GitHub Actions **fallará** con código de salida `2` y un mensaje claro en los logs.
+- **No se reintenta**: tal y como dice el requisito, ante un bloqueo real se detiene y avisa. No hay bucle de reintentos infinitos.
+
+### Si el job falla y no quieres que commitee data/
+
+- El workflow solo commiteará `data/` si el scraper termina exitosamente (código de salida `0`) **y** hay cambios detectados en la carpeta `data/`.
+- Si el scraper falla (bloqueo, error de red, etc.), el job fallará y **no se commiteará nada** en `data/`. El estado quedará como "failed" en la pestaña Actions, y los logs mostrarán el motivo (por ejemplo, "Posible bloqueo o captcha detectado").
+
+### Solución de problemas
+
+- **Job queda parado o lento**: las pausas aleatorias de 2-5 s entre páginas pueden hacer que tarde más de 2 minutos. El workflow tiene `timeout-minutes: 120` de seguridad.
+- **No se crean ficheros data/**: asegúrate de estar usando `python scraper.py` (sin `--no-save`) en el workflow; el modo `--no-save` no escribe nada en disco.
+- **Error de permisos**: el workflow tiene `permissions: contents: write` para poder commitear `data/`. Si aún así falla, revisa que la cuenta o bot tiene permisos de escritura en el repositorio.
+
+## Histórico de precios
+
 La primera ejecución crea automáticamente la carpeta `data/`:
 
 - **`data/products.json`**: catálogo acumulado, con un registro por SKU:

@@ -1,0 +1,105 @@
+name: pc-price-tracker
+
+on:
+  schedule:
+    # Todos los días a las 11:00 UTC
+    - cron: "0 11 * * *"
+  workflow_dispatch:
+    # Permitir ejecución manual desde la pestaña Actions
+    inputs:
+      reason:
+        description: "Razón de la ejecución manual"
+        required: false
+        default: "Manual trigger"
+
+concurrency:
+  # Evita que se solapen ejecuciones simultáneas; el nuevo reemplaza al anterior
+  group: scraper-run-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write  # necesario para commitear data/
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      # --- Checkout ---
+      - name: Cancela si ya está corriendo (check)
+        uses: pencilward/cancel-action@main
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Necesario para poder commitear data/ después
+          persist-credentials: true
+
+      # --- Setup Python ---
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # --- Playwright: instalar Chromium con system dependencies ---
+      - name: Install Playwright chromium
+        run: playwright install --with-deps chromium
+
+      # --- Opcional: aumentar límite de ficheros abiertos si es necesario ---
+      # No suele ser necesario, pero dejamos la línea comentada por si acaso:
+      # - name: Increase fs.inotify watchers
+      #   run: sudo sysctl -w fs.inotify.max_user_watches=524288
+
+      # --- Ejecutar scraper ---
+      - name: Run scraper (guarda histórico en data/)
+        # Si quieres ejecutar sin guardado, cambia el comando por:
+        # `python scraper.py --no-save`
+        run: |
+          python scraper.py
+        # Capture el código de salida para decidir qué hacer después
+        env:
+          SCRAPE_EXIT_CODE: "0"
+
+      # --- Determinar si data/ cambió ---
+      - name: Check if data/ has changes
+        id: data_changes
+        run: |
+          # Inicializamos la bandera
+          echo "has_changes=false" >> $GITHUB_OUTPUT
+          # Si la carpeta data/ existe y tiene ficheros, la comparamos con git
+          if [ -d data ]; then
+            # git diff staged vs working tree, or just check if there are untracked/modified files
+            if git diff --quiet data/ && [ -z "$(git status --porcelain data/)" ]; then
+              echo "No changes in data/"
+            else
+              echo "Changes detected in data/"
+              echo "has_changes=true" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "data/ folder does not exist (first run or --no-save)"
+          fi
+
+      # --- Si hay cambios, commitear y push ---
+      - name: Commit data/ changes
+        if: steps.data_changes.outputs.has_changes == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/
+          # Usamos la fecha de hoy formateada
+          DATE=$(date -u +"%Y-%m-%d")
+          git commit -m "data: precios ${DATE}"
+          git push
+
+      # --- Fallo explícito si el scraper falló ---
+      - name: Fail job if scraper exited non-zero
+        if: failure()
+        run: |
+          echo "El scraper terminó con código de salida distinto de 0. Revisa los logs arriba."
+          exit 1
