@@ -1,91 +1,477 @@
-/* Estética terminal de trading: oscuro, mono, acento único */
+/* ==========================================================================
+   Design: Dark technical terminal theme - Awwwards quality
+   Single accent: #00d4aa (verde técnico, el único color de acento)
+   No gradients morados, tipografía densa, KPIs en cabecera, sparklines por fila
+   ========================================================================== */
+
+/* --- Variables CSS --- */
 :root {
   --bg: #0a0a0f;
   --bg-elevated: #12121a;
+  --bg-subtle: #1a1a24;
   --fg: #e0e0e8;
   --muted: #6b6b80;
-  --accent: #00d4aa; /* verde técnico, un solo color */
+  --accent: #00d4aa; /* verde técnico, el único color de acento */
+  --accent-hover: #00f5bb;
   --card: #1a1a24;
   --border: #2a2a3a;
+  --danger: #ff5f57;
+  --success: #00d4aa;
+  --sparkline-bg: #0d0d14;
 }
 
+/* --- Reset y base --- */
 * {
   box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+  tab-size: 4;
 }
 
 body {
-  margin: 0;
-  font-family: 'Fira Code', monospace, system-ui, -apple-system;
+  font-family: 'Fira Code', 'JetBrains Mono', 'Source Code Pro', monospace, system-ui, -apple-system;
   background: var(--bg);
   color: var(--fg);
-  line-height: 1.5;
+  line-height: 1.6;
 }
 
-/* Fuente display para títulos */
-.display {
-  font-family: 'JetBrains Mono', monospace;
-  /* Could swap for a display font with character, but keeping mono for consistency */
-}
-
-h1, h2, h3 {
-  font-weight: 600;
-  color: var(--fg);
-}
-
-/* Accent only on interactive elements or specific marks */
-a {
-  color: var(--accent);
-  text-decoration: none;
-}
-
-a:hover {
-  text-decoration: underline;
-}
-
-/* Focus visible for accessibility */
-*:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-}
-
-/* Reduce motion */
+/* Evitar animaciones para usuarios que lo soliciten */
 @media (prefers-reduced-motion: reduce) {
-  * {
-    transition-duration: 0ms !important;
-    animation-duration: 0ms !important;
-    animation-iteration-count: 1 !important;
+  *, *::before, *::after {
+    animation-duration: 0s !important;
+    transition-duration: 0s !important;
   }
 }
 
-/* Contenedor principal */
+/* --- Tipografía --- */
+.display-title {
+  font-family: 'Orbitron', 'Fira Code', monospace;
+  letter-spacing: 0.15em;
+  color: var(--fg);
+}
+
+h1, h2, h3, h4, h5, h6 {
+  font-family: 'Orbitron', 'Fira Code', monospace;
+  letter-spacing: 0.05em;
+  color: var(--fg);
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+h1 { font-size: 2rem; margin-bottom: 0.5rem; }
+h2 { font-size: 1.75rem; margin-bottom: 1rem; }
+h3 { font-size: 1.25rem; margin-bottom: 0.75rem; }
+p { margin-bottom: 1rem; }
+
+/* --- Contenedor principal --- */
 .app {
   min-height: 100vh;
   padding: 2rem;
+  max-width: 100%;
 }
 
-/* Hero section */
-.hero {
+/* --- Header / cabecera con KPIs --- */
+.app-header {
   background: var(--bg-elevated);
   border-radius: 8px;
   padding: 2rem;
   border: 1px solid var(--border);
   margin-bottom: 2rem;
+  position: relative;
+  overflow: hidden;
 }
 
-/* Listado */
+.app-header::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 3px;
+  background: linear-gradient(90deg, var(--accent), var(--accent-hover));
+  border-radius: 8px 8px 0 0;
+}
+
+.header-title {
+  font-size: 1.75rem;
+  font-weight: 600;
+  margin-bottom: 0.5rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.header-title::before {
+  content: '🖥️';
+  font-size: 1.2rem;
+}
+
+.header-subtitle {
+  font-size: 0.875rem;
+  color: var(--muted);
+  margin-bottom: 1.5rem;
+}
+
+.header-subtitle span {
+  color: var(--accent);
+  margin-left: 0.25rem;
+}
+
+/* --- KPIs section --- */
+.kpis-section {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 1rem;
+  margin-top: 1rem;
+}
+
+.kpi {
+  background: var(--card);
+  border-radius: 8px;
+  padding: 1.25rem;
+  border: 1px solid var(--border);
+  position: relative;
+  transition: border-color 0.2s ease, transform 0.2s ease;
+}
+
+.kpi:hover {
+  border-color: var(--accent);
+  transform: translateY(-2px);
+}
+
+.kpi::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 4px;
+  height: 0%;
+  background: var(--accent);
+  border-radius: 0 8px 0 0;
+  transition: height 0.3s ease;
+}
+
+.kpi:hover::after {
+  height: 100%;
+}
+
+.kpi span {
+  display: block;
+  margin-top: 0.5rem;
+  font-size: 0.875rem;
+}
+
+.kpi .valor {
+  font-size: 2rem;
+  font-weight: 600;
+  color: var(--fg);
+}
+
+.kpi .etiqueta {
+  color: var(--muted);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+/* --- Listado filtrable --- */
 .listado {
   background: var(--bg-elevated);
   border-radius: 8px;
   padding: 1.5rem;
   border: 1px solid var(--border);
+  margin-bottom: 2rem;
   overflow-x: auto;
 }
 
-/* Ranking */
+.filtros {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 1rem;
+  margin-bottom: 1.5rem;
+  flex-wrap: wrap;
+}
+
+.filtros label {
+  font-size: 0.75rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 0.5rem;
+  display: block;
+}
+
+.filtros input,
+.filtros select {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  padding: 0.75rem 1rem;
+  border-radius: 6px;
+  font-family: 'Fira Code', monospace;
+  font-size: 0.875rem;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.filtros input:focus,
+.filtros select:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(0, 212, 170, 0.15);
+}
+
+.filtros input::placeholder {
+  color: var(--muted);
+}
+
+.filtros select {
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%236b6b80' stroke-width='2'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 0.5rem center;
+  padding-right: 2.5rem;
+}
+
+.filtros select option {
+  background: var(--bg);
+  color: var(--fg);
+}
+
+/* --- Lista de productos --- */
+.lista {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 1.5rem;
+}
+
+.price-card {
+  background: var(--card);
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  overflow: hidden;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+  animation: cardIn 0.5s ease-forwards;
+}
+
+.price-card:hover {
+  border-color: var(--accent);
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+}
+
+.price-card:nth-child(2n) {
+  animation-delay: 0.1s;
+}
+
+.price-card:nth-child(3n) {
+  animation-delay: 0.2s;
+}
+
+.price-card:nth-child(4n) {
+  animation-delay: 0.3s;
+}
+
+.price-card:nth-child(5n) {
+  animation-delay: 0.4s;
+}
+
+@keyframes cardIn {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.price-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.875rem 1rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+}
+
+.price-sku {
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+.price-hito {
+  font-size: 0.65rem;
+  color: var(--accent);
+  font-weight: 500;
+}
+
+.price-card-body {
+  padding: 1rem;
+}
+
+.price-name {
+  font-size: 0.875rem;
+  font-weight: 500;
+  margin-bottom: 0.5rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.price-details {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 0.75rem;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.price-current {
+  color: var(--fg);
+  font-weight: 500;
+  font-size: 1.1rem;
+}
+
+.price-previous {
+  color: var(--muted);
+  text-decoration: line-through;
+  font-size: 0.875rem;
+}
+
+.price-discount {
+  color: var(--accent);
+  font-weight: 500;
+  margin-left: 0.25rem;
+  font-size: 0.8rem;
+}
+
+.price-attrs {
+  color: var(--muted);
+  font-size: 0.7rem;
+  margin-top: 0.25rem;
+}
+
+.price-sparkline {
+  height: 8px;
+  width: 100%;
+  background: var(--sparkline-bg);
+  border-radius: 4px;
+  overflow: hidden;
+  margin-top: 0.75rem;
+}
+
+.sparkline-bg {
+  height: 100%;
+  background: var(--sparkline-bg);
+}
+
+.sparkline-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 4px;
+  transition: background-color 0.2s ease;
+}
+
+.price-card.discount .sparkline-fill {
+  background: #ff6b6b;
+}
+
+/* Ranking de mayores bajadas */
 .ranking {
   background: var(--bg-elevated);
   border-radius: 8px;
   padding: 1.5rem;
   border: 1px solid var(--border);
-  margin-bottom: 2rem;
+  margin-top: 2rem;
+}
+
+.ranking-h2 {
+  font-size: 1.25rem;
+  margin-bottom: 1rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.ranking-lista {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.ranking-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.5rem 0;
+  font-size: 0.875rem;
+  color: var(--fg);
+}
+
+.ranking-item span:first-child {
+  color: var(--muted);
+  flex: 1;
+}
+
+.ranking-item span:last-child {
+  color: var(--accent);
+  font-weight: 500;
+  margin-left: 1rem;
+}
+
+/* Aviso de muestra */
+.warning-banner {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1rem 1.25rem;
+  margin-bottom: 1.5rem;
+  color: var(--accent);
+}
+
+.warning-banner span {
+  font-weight: 600;
+  font-size: 0.875rem;
+}
+
+.warning-banner p {
+  margin-top: 0.25rem;
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+/* Estados vacíos */
+.empty-state {
+  text-align: center;
+  padding: 4rem 2rem;
+  color: var(--muted);
+}
+
+/* Responsive */
+@media (max-width: 640px) {
+  .app {
+    padding: 1rem;
+  }
+
+  .kpis-section {
+    grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  }
+
+  .lista {
+    grid-template-columns: 1fr;
+  }
+
+  .filtros {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Focus visible */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
