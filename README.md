@@ -155,6 +155,71 @@ siguiente manera:
   poder commitear `data/`. Si aún así falla, revisa que la cuenta o bot tiene
   permisos de escritura en el repositorio.
 
+## Runner self-hosted en Windows
+
+Este proyecto está configurado para usar un **runner self-hosted** en un PC con
+Windows, con el fin de evitar los bloqueos de Cloudflare que afectan a las IPs
+oficiales de GitHub Actions.
+
+### Registrar un runner self-hosted en Windows
+
+1. Entra en tu repositorio en github.com, ve a la pestaña **Settings > Actions >
+   Runners > Self-hosted runners** y pulca en **"New self-hosted runner"**.
+2. Selecciona **Windows** como sistema operativo y dale un nombre al runner
+   (ejemplo: `windows-self-hosted`).
+3. Se te mostrarán comandos para descargar e instalar el runner. Ejecútalos en
+   un PowerShell administrador en tu PC con Windows:
+
+```powershell
+# Crear y entrar en la carpeta del runner
+md runners-selfhosted
+cd runners-selfhosted
+
+# Descargar e instalar el runner
+& curl -o- https://.githubusercontent.com/actions/runner/releases/download/v2.311.0/actions-runner-windows-x64-2.311.0.zip | tar -zxf -
+
+# Registrar el runner (usando el nombre que elegiste en el paso 2)
+.\runner.ps1 -configurl "https://api.github.com/repos/TU_USUARIO/TU_REPO/actions/runners/configuration" -token TU_TOKEN
+
+# Iniciar el runner (quedará como servicio y esperará en cola los jobs)
+.\runner.ps1 run
+```
+
+### Arrancar el runner al iniciar sesión
+
+Para que el runner esté siempre disponible:
+
+1. Crea un acceso directo al archivo `.\runner.ps1 run`
+2. Ponlo en la carpeta **Inicio** del menú de inicio (Presiona `Win + R`, escribe
+   `shell:startup` y pulca Enter, luego pega el acceso directo).
+3. El runner se iniciará automáticamente cada vez que enciendas Windows y
+   quedará esperando en cola los jobs de GitHub Actions.
+
+### Comportamiento en cola si el PC está apagado
+
+Si apagas tu PC, los jobs de GitHub Actions **permanecen en cola** esperando a que
+el runner se conecte. GitHub los mantendrá en cola un tiempo límite (aprox. 24
+horas), después los marcará como fallen con un error de tiempo agotado. Cuando
+enciendas el PC y el runner se inicie, los jobs pending se ejecutarán en orden.
+
+### Configuración mínima requerida
+
+- **Sistema operativo**: Windows 10 o 11 (de 64 bits)
+- **Python 3.10+** debe estar en el PATH del sistema
+- **Git** debe estar instalado y en el PATH
+- **PowerShell** 7+ (recomendado) o PowerShell 5.1 (incluido en Windows 10)
+- **Espacio en disco**: al menos 2 GB libres para el runner y el caché de Playwright
+
+### Consejos adicionales
+
+- Mantén el PC encendido o en modo de hibernación (no en suspensión profunda) para
+  que el runner esté siempre disponible.
+- Puedes etiquetar el runner con etiquetas personalizadas añadiendo `--labels
+  "label1,label2"` al comando de registro, y luego usar `runs-on: [self-hosted,
+  Windows, label1]` en el workflow si quieres compartirlos con otros repositorios.
+- El runner consumirá récursos moderados (CPU, memoria) durante la ejecución del
+  scraper (≈ 1-2 GB de RAM, picos de CPU durante la navegación).
+
 ## Histórico de precios
 
 La primera ejecución crea automáticamente la carpeta `data/`:

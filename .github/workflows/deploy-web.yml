@@ -1,22 +1,19 @@
 name: Deploy Web
 
 on:
-  # Cuando se toca algún archivo en web/
   push:
+    branches: [main]
     paths:
       - web/**
-  # Ejecución manual desde la pestaña Actions
+      - .github/workflows/deploy-web.yml
   workflow_dispatch:
-  # Espera a que termine el workflow de scrape (los commits del bot no disparan push)
   workflow_run:
     workflows: ["pc-price-tracker"]
-    types:
-      - completed
+    types: [completed]
 
 concurrency:
-  # Evita que se solapen despliegues; el nuevo reemplaza al anterior
-  group: deploy-web-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: pages
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -27,29 +24,34 @@ jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    defaults:
+      run:
+        working-directory: web
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Node.js
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web/package-lock.json
 
-      - name: Install dependencies
+      - name: Instalar dependencias
         run: npm ci
 
-      - name: Ejecutar script de generación de precios
-        # Este script lee los datos y genera web/public/data/prices.json
-        # Siempre se ejecuta, aunque el scraper haya fallado, para asegurar
-        # que los datos estén actualizados
+      - name: Build (genera prices.json y compila)
         run: npm run build
 
-      - name: Upload Pages artifact
+      - name: Subir artefacto
         uses: actions/upload-pages-artifact@v3
         with:
-          folder: web/dist
+          path: web/dist
 
-      - name: Deploy to GitHub Pages
+      - name: Deploy
+        id: deployment
         uses: actions/deploy-pages@v4
