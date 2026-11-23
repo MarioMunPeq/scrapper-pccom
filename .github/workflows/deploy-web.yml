@@ -21,12 +21,9 @@ permissions:
   id-token: write
 
 jobs:
-  build-and-deploy:
+  build:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
     defaults:
       run:
         working-directory: web
@@ -44,14 +41,24 @@ jobs:
       - name: Instalar dependencias
         run: npm ci
 
-      - name: Build (genera prices.json y compila)
+      - name: Build
         run: npm run build
+
+      - name: Configurar Pages
+        uses: actions/configure-pages@v5
 
       - name: Subir artefacto
         uses: actions/upload-pages-artifact@v3
         with:
           path: web/dist
 
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
       - name: Deploy
         id: deployment
         uses: actions/deploy-pages@v4
