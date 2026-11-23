@@ -12,10 +12,11 @@
 const fs = require('fs')
 const path = require('path')
 
-// Rutas del repositorio
-const REPO_ROOT = 'C:\\Users\\Mario\\Documents\\PROYECTOS\\Scrapper pccom'
+// Rutas del repositorio (usando rutas relativas al script)
+const SCRIPT_DIR = path.resolve(path.dirname(__FILE__))
+const REPO_ROOT = path.resolve(SCRIPT_DIR, '..', '..')
 const DATA_DIR = path.join(REPO_ROOT, 'data')
-const PUBLIC_DIR = 'C:\\Users\\Mario\\Documents\\PROYECTOS\\Scrapper pccom\\web\\public'
+const PUBLIC_DIR = path.resolve(SCRIPT_DIR, '..', 'public')
 const PUBLIC_DATA_DIR = path.join(PUBLIC_DIR, 'data')
 
 const HISTORY_FILE = path.join(DATA_DIR, 'history.csv')
