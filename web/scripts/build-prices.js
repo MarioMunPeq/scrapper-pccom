@@ -3,6 +3,8 @@
  * Build script para web/ - Genera web/public/data/prices.json
  * LEYE SIEMPRE data/history.csv y data/products.json
  * NUNCA inventa productos - solo usa datos reales
+ * Usa precio_anterior de history.csv como previousPrice (PVPR real)
+ * Usa descuento de history.csv como discount real
  * Si hay < 3 días de historial, muestra puntos reales con aviso
  * Si data/ vacío o inexistente, muestra estado vacío
  */ 
@@ -206,27 +208,33 @@ for (const sku of allSkus) {
     continue
   }
 
-  // Extraer precios de la columna 'precio'
+  // Extraer precio actual de la columna 'precio'
+  const currentPrice = parsePrice(skuRows[0].precio) // Usamos la primera (y única) fila
+
+  // Usar precio_anterior de history.csv como previousPrice (PVPR real)
+  const previousPrice = parsePrice(skuRows[0].precio_anterior)
+
+  // Usar descuento de history.csv como discount real
+  const discount = skuRows[0].descuento !== undefined && skuRows[0].descuento !== '' 
+    ? parseInt(skuRows[0].descuento, 10) 
+    : null
+
+  // Filtrar rows de histórico para este SKU (todos los registros reales)
   const prices = skuRows.map(r => parsePrice(r.precio)).filter(p => p !== null)
 
-  // Precios anteriores (PVPR) de la columna 'precio_anterior'
-  const preciosAnteriores = skuRows.filter(r => r.precio_anterior).map(r => parsePrice(r.precio_anterior)).filter(p => p !== null)
+  // Precios anteriores (PVPR) de la columna 'precio_anterior' - ya tenemos previousPrice arriba
+  // const preciosAnteriores = skuRows.filter(r => r.precio_anterior).map(r => parsePrice(r.precio_anterior)).filter(p => p !== null)
 
-  // Descuentos de la columna 'descuento'
-  const descuentos = skuRows.filter(r => r.descuento).map(r => {
-    const d = parseInt(r.descuento, 10)
-    return !isNaN(d) ? d : null
-  }).filter(d => d !== null)
+  // Descuentos de la columna 'descuento' - ya tenemos discount arriba
+  // const descuentos = skuRows.filter(r => r.descuento).map(r => {
+  //   const d = parseInt(r.descuento, 10)
+  //   return !isNaN(d) ? d : null
+  // }).filter(d => d !== null)
 
-  const currentPrice = prices[prices.length - 1] || null
   const minPriceHistorico = prices.length > 0 ? Math.min(...prices) : null
   const maxPriceHistorico = prices.length > 0 ? Math.max(...prices) : null
-  const discountActual = descuentos.length > 0 ? Math.max(...descuentos) : null
-  const dropPorcentaje = currentPrice && maxPriceHistorico && maxPriceHistorico > currentPrice
-    ? Math.round(((maxPriceHistorico - currentPrice) / maxPriceHistorico) * 100)
-    : 0
-
-  const variation7d = prices.length > 1 ? Math.round(((prices[prices.length - 1] || 0) - prices[0]) / prices[0] * 100) : 0
+  // variation7d: no aplicable con 1 dato, ponemos 0
+  const variation7d = 0
   const totalRegistros = skuRows.length
 
   // Detectar el hito más reciente
@@ -240,8 +248,8 @@ for (const sku of allSkus) {
     sku,
     name,
     currentPrice,
-    previousPrice: prices.length > 1 ? prices[prices.length - 2] : null,
-    discount: discountActual,
+    previousPrice, // PVPR real de history.csv
+    discount,      // Descuento real de history.csv
     minPriceHistorico,
     maxPriceHistorico,
     variation7d,

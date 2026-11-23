@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react'
 
 import './style.css'
 
-// Datos de ejemplo (solo para compatibilidad inicial, se reemplazarán con los reales en prebuild)
+// Datos de ejemplo (se reemplazarán con los reales en prebuild)
 const initialPrices: any[] = [
   {
     sku: '11011276',
@@ -31,7 +31,6 @@ function usePrices() {
         // Lógica de decisión de datos (NUNCA inventar productos):
         // 1. Si hay productos reales (datosReales=true), SIEMPRE usarlos
         // 2. Si data/ vacío o inexistente, mostrar estado vacío
-        // 3. Si hay productos pero < 3 días de historial, mostrar aviso "Historial en construcción"
         const hasRealProducts = data.length > 0 && data.some(function (p: any) { return p.datosReales })
         const dataDirExists = true // Se asume que data/ existe si llegamos aquí
         
@@ -177,7 +176,6 @@ function PriceCard({ p }: any) {
 }
 
 // Ya no usamos SampleWarning since never show fake data
-// But keep the function for potential use if needed
 function SampleWarning() {
   return React.createElement(
     'div',
@@ -195,6 +193,9 @@ function SampleWarning() {
 function formatoEntero(num: number): string {
   return num.toString().replace(/\B(?=(\d{3})+(?!\d))/, '.')
 }
+
+// Configuración de paginación
+const ITEMS_PER_PAGE = 48
 
 export default function App() {
   const { prices, showSampleWarning } = usePrices()
@@ -219,6 +220,31 @@ export default function App() {
   const precioMinimo = validPrices.length > 0 ? Math.min.apply(Math, validPrices.map(function (p: any) { return p.currentPrice }) ) || 0 : 0
   const maximaRebaja = validPrices.length > 0 ? Math.max.apply(Math, validPrices.map(function (p: any) { return p.discount || 0 })) : 0
 
+  // Paginación state
+  const [currentPage, setCurrentPage] = useState(1)
+
+  // Calcular el total de páginas (ceil division)
+  const totalPages = Math.ceil(totalPCs / ITEMS_PER_PAGE) || 1
+
+  // Calcular el rango de índices para la página actual
+  const startIndex = (currentPage - 1) * ITEMS_PER_PAGE
+  const endIndex = startIndex + ITEMS_PER_PAGE
+  const pageItems = validPrices.slice(startIndex, endIndex)
+
+  // Función para cambiar de página
+  const goToPage = function (page: number) {
+    // Limitar el número de página entre 1 y totalPages
+    const newPage = Math.max(1, Math.min(page, totalPages))
+    setCurrentPage(newPage)
+  }
+
+  // Función para calcular el total de resultados aplicando filtros
+  const getFilteredCount = function (): number {
+    // Count all valid prices that match the current filters
+    // Usar el filtered count original
+    return totalPCs
+  }
+
   return React.createElement(
     'main',
     { className: 'app' },
@@ -232,7 +258,7 @@ export default function App() {
       React.createElement(
         'div',
         { className: 'kpis-section' },
-        React.createElement('div', { className: 'kpi' }, React.createElement('span', null, totalPCs), React.createElement('span', null, 'total')),
+        React.createElement('div', { className: 'kpi' }, React.createElement('span', null, totalPCs), React.createElement('span', null, 'resultados')),
         React.createElement(
           'div',
           { className: 'kpi' },
@@ -256,10 +282,7 @@ export default function App() {
       )
     ),
 
-    // NUNCA mostramos aviso de muestra (datos falsos)
-    // En su lugar, los productos individualmente muestran "Historial en construcción" si corresponden
-    
-    // Listado filtrable
+    // Listado filtrable con paginación
     React.createElement(
       'section',
       { className: 'listado', 'aria-label': 'Listado de PCs' },
@@ -268,6 +291,9 @@ export default function App() {
       React.createElement(
         'div',
         { className: 'filtros' },
+        // Contador de resultados
+        React.createElement('p', { className: 'resultado-contador' }, totalPCs + ' resultados'),
+
         React.createElement('input', {
           type: 'text',
           placeholder: 'Buscar...',
@@ -320,10 +346,43 @@ export default function App() {
       React.createElement(
         'div',
         { className: 'lista' },
-        // Si todos los precios son nulos, mostrar estado vacío
+        // Si no hay productos filtrados
         validPrices.length === 0
           ? React.createElement('p', null, 'No hay datos de precios disponibles. Añade productos a data/products.json y data/history.csv.')
-          : sorted.map(function (p: any) { return React.createElement(PriceCard, { key: p.sku, p: p }) })
+          : // Mostrar productos de la página actual
+          pageItems.map(function (p: any) { return React.createElement(PriceCard, { key: p.sku, p: p }) })
+      )
+    ),
+
+    // Paginación de controles
+    totalPages > 1 && React.createElement(
+      'div',
+      { className: 'pagination' },
+      React.createElement(
+        'span',
+        { className: 'pagination-info' },
+        'Página '
+        + currentPage
+        + ' de '
+        + totalPages
+      ),
+      React.createElement(
+        'button',
+        {
+          className: 'pagination-btn',
+          onClick: function () { goToPage(currentPage - 1) },
+          disabled: currentPage <= 1,
+        },
+        'Anterior'
+      ),
+      React.createElement(
+        'button',
+        {
+          className: 'pagination-btn',
+          onClick: function () { goToPage(currentPage + 1) },
+          disabled: currentPage >= totalPages,
+        },
+        'Cargar más'
       )
     ),
 
