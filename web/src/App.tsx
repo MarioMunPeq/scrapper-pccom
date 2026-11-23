@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react'
 
 import './style.css'
 
-// Datos de ejemplo (se reemplazarán con los reales en prebuild)
+// Datos de ejemplo (solo para compatibilidad inicial, se reemplazarán con los reales en prebuild)
 const initialPrices: any[] = [
   {
     sku: '11011276',
@@ -27,22 +27,23 @@ function usePrices() {
         const res = await fetch('/data/prices.json')
         const data: any[] = await res.json()
         setPrices(data)
-        // Lógica de decisión de datos:
-        // 1. Si hay productos reales (datosReales=true), usarlos siempre
-        // 2. Si hay producto de muestra (esMuestra=true) y no hay reales, mostrar aviso
-        // 3. Si data/ vacío, mostrar estado vacío
-        const hasRealProducts = data.some(function (p: any) { return p.datosReales })
-        const hasSampleProduct = data.some(function (p: any) { return p.esMuestra })
-        const allNullPrices = data.length > 0 && data.every(function (p: any) { return p.currentPrice == null })
-
-        // Mostrar aviso de historial corto solo cuando hay productos reales pero < 3 días
-        const histogramDays = data.filter(function (p: any) { return p.totalRegistros > 0 }).reduce(function (acc: number, p: any) { return acc + p.totalRegistros }, 0)
-        const shortHistoryWarning = hasRealProducts && histogramDays < 3
-
-        // Si hay productos con precios nulos (datos vacíos), mostrar estado vacío
-        const showEmptyState = allNullPrices || (!hasRealProducts && !hasSampleProduct)
-
-        setShowSampleWarning(showEmptyState ? false : shortHistoryWarning)
+        
+        // Lógica de decisión de datos (NUNCA inventar productos):
+        // 1. Si hay productos reales (datosReales=true), SIEMPRE usarlos
+        // 2. Si data/ vacío o inexistente, mostrar estado vacío
+        // 3. Si hay productos pero < 3 días de historial, mostrar aviso "Historial en construcción"
+        const hasRealProducts = data.length > 0 && data.some(function (p: any) { return p.datosReales })
+        const dataDirExists = true // Se asume que data/ existe si llegamos aquí
+        
+        if (!dataDirExists) {
+          // data/ no existe - estado vacío
+          setShowSampleWarning(false)
+          return
+        }
+        
+        // Si hay productos reales, siempre se muestran (aunque tengan < 3 días)
+        // El aviso "Historial en construcción" se mostrará por producto individual
+        setShowSampleWarning(false) // Ocultar aviso de muestra siempre (no hay datos falsos)
       } catch (e) {
         console.warn('No se pudo cargar prices.json', e)
         setShowSampleWarning(true)
@@ -124,6 +125,10 @@ function PriceCard({ p }: any) {
     return price.toString().replace(/\B(?=(\d{3})+(?!\d))/, '.')
   }
 
+  // Determinar si mostrar nota de historial en construcción
+  const showHistoryNote = p.showHistoryNote !== undefined ? p.showHistoryNote : false
+  const numDiasHistorial = p.numDiasHistorial !== undefined ? p.numDiasHistorial : 0
+
   return React.createElement(
     'div',
     { className: 'price-card', key: p.sku },
@@ -131,7 +136,13 @@ function PriceCard({ p }: any) {
       'div',
       { className: 'price-card-header' },
       React.createElement('span', { className: 'price-sku' }, p.sku),
-      React.createElement('span', { className: 'price-hito' }, p.hito || '')
+      React.createElement('span', { className: 'price-hito' }, p.hito || ''),
+      // Mostrar nota de historial en construcción si corresponde
+      showHistoryNote && React.createElement(
+        'span',
+        { className: 'price-hito-historial' },
+        'Historial en construcción: ' + numDiasHistorial + ' día(s)'
+      )
     ),
     React.createElement(
       'div',
@@ -165,6 +176,8 @@ function PriceCard({ p }: any) {
   )
 }
 
+// Ya no usamos SampleWarning since never show fake data
+// But keep the function for potential use if needed
 function SampleWarning() {
   return React.createElement(
     'div',
@@ -209,7 +222,7 @@ export default function App() {
   return React.createElement(
     'main',
     { className: 'app' },
-    // Header con KPIs y aviso
+    // Header con KPIs
     React.createElement(
       'header',
       { className: 'app-header' },
@@ -243,9 +256,9 @@ export default function App() {
       )
     ),
 
-    // Aviso de muestra si corresponde (solo cuando hay productos reales pero < 3 días)
-    showSampleWarning && React.createElement(SampleWarning),
-
+    // NUNCA mostramos aviso de muestra (datos falsos)
+    // En su lugar, los productos individualmente muestran "Historial en construcción" si corresponden
+    
     // Listado filtrable
     React.createElement(
       'section',

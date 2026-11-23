@@ -1,18 +1,19 @@
 #!/usr/bin/env node
 /** 
  * Build script para web/ - Genera web/public/data/prices.json
- * Lee data/history.csv y data/products.json desde la raíz del repositorio
- * Si el histórico tiene menos de 3 días pero hay productos reales, usa los datos reales 
- * con aviso. Solo usa datos de muestra si data/ está vacío.
+ * LEYE SIEMPRE data/history.csv y data/products.json
+ * NUNCA inventa productos - solo usa datos reales
+ * Si hay < 3 días de historial, muestra puntos reales con aviso
+ * Si data/ vacío o inexistente, muestra estado vacío
  */ 
 
 const fs = require('fs')
 const path = require('path')
 
-// Rutas absolutas basadas en la estructura conocida
+// Rutas del repositorio
 const REPO_ROOT = 'C:\\Users\\Mario\\Documents\\PROYECTOS\\Scrapper pccom'
 const DATA_DIR = path.join(REPO_ROOT, 'data')
-const PUBLIC_DIR = path.join('C:\\Users\\Mario\\Documents\\PROYECTOS\\Scrapper pccom\\web\\public')
+const PUBLIC_DIR = 'C:\\Users\\Mario\\Documents\\PROYECTOS\\Scrapper pccom\\web\\public'
 const PUBLIC_DATA_DIR = path.join(PUBLIC_DIR, 'data')
 
 const HISTORY_FILE = path.join(DATA_DIR, 'history.csv')
@@ -53,50 +54,6 @@ function extractAttributes(name) {
 }
 
 /** 
- * Clasifica GPU: 'ti' para RTX 5070 Ti, '5070' para RTX 5070, null para otro 
- */ 
-function classifyGpu(name) {
-  if (/RTX\s+5070\s*Ti\b/gi.test(name)) return 'ti'
-  if (/RTX\s+5070(?!Ti)/gi.test(name)) return '5070'
-  return null
-}
-
-/** 
- * Obtiene la variación simulada en 7 días 
- */ 
-function get7dVariation(current, historicalPrices) {
-  if (historicalPrices.length < 2) return 0
-  const sorted = [...historicalPrices].sort((a, b) => a - b)
-  const oldPrice = sorted[Math.max(0, sorted.length - 2)]
-  if (!oldPrice || oldPrice === current) return 0
-  return Math.round(((current - oldPrice) / oldPrice) * 100)
-}
-
-/** 
- * Obtiene la fecha formateada dd/mm 
- */ 
-function formatDateMd(d) {
-  return `${d.getDate()}/${d.getMonth() + 1}`
-}
-
-/** 
- * Detecta si la fecha es un hito conocido y devuelve la etiqueta 
- */ 
-function isHito(date) {
-  const d = new Date(date)
-  if (d.getDate() === BLACK_FRIDAY.getDate() && d.getMonth() === BLACK_FRIDAY.getMonth())
-    return 'Black Friday (27/11)'
-  if (d.getDate() === CYBER_MONDAY.getDate() && d.getMonth() === CYBER_MONDAY.getMonth())
-    return 'Cyber Monday (30/11)'
-  if (d.getDate() === CHRISTMAS.getDate() && d.getMonth() === CHRISTMAS.getMonth())
-    return 'Navidad (25/12)'
-  if (d.getDate() === REYES.getDate() && d.getMonth() === REYES.getMonth())
-    return 'Reyes (6/1)'
-  if (d >= JANUARY_SALES_START) return 'Rebajas enero'
-  return null
-}
-
-/** 
  * Parses un precio string a número (quita €, separadores de miles) 
  */ 
 function parsePrice(value) {
@@ -111,16 +68,15 @@ function parsePrice(value) {
 
   if (processed.includes(',')) {
     // Formato español: "1.799,00" -> 1799.00
-    // Quitar puntos (separadores de miles) y reemplazar coma por punto (decimal)
     processed = processed.replace(/\./g, '').replace(',', '.')
   } else if (processed.match(/^\d+\.\d{2}$/)) {
-    // Formato internacional exacto "2489.00" -> 2489 (punto es decimal, no tocher)
-    processed = processed // No hacer nada
+    // Formato internacional exacto "2489.00"
+    processed = processed
   } else if (processed.match(/^\d+\.\d{3}$/)) {
     // Formato "1.799" (punto miles, sin decimales) -> 1799
     processed = processed.replace(/\./g, '')
   } else if (processed.match(/^\d+\.\d+$/) && processed.split('.')[1].length >= 3) {
-    // Punto decimal con 3+ dígitos o formato mixto: tratar como español
+    // Punto decimal con 3+ dígitos: tratar como español
     processed = processed.replace(/\./g, '').replace(',', '.')
   }
 
@@ -145,180 +101,159 @@ function parseCSV(content) {
   return rows
 }
 
+/** 
+ * Detecta si la fecha es un hito conocido y devuelve la etiqueta 
+ */ 
+function isHito(date) {
+  const d = new Date(date)
+  if (d.getDate() === BLACK_FRIDAY.getDate() && d.getMonth() === BLACK_FRIDAY.getMonth())
+    return 'Black Friday (27/11)'
+  if (d.getDate() === CYBER_MONDAY.getDate() && d.getMonth() === CYBER_MONDAY.getMonth())
+    return 'Cyber Monday (30/11)'
+  if (d.getDate() === CHRISTMAS.getDate() && d.getMonth() === CHRISTMAS.getMonth())
+    return 'Navidad (25/12)'
+  if (d.getDate() === REYES.getDate() && d.getMonth() === REYES.getMonth())
+    return 'Reyes (6/1)'
+  if (d >= JANUARY_SALES_START) return 'Rebajas enero'
+  return null
+}
+
 /* --- Lógica principal --- */
 
-// Leer history.csv
 let historyRows = []
+let products = {}
+
+// Verificar si data/ existe
+const dataDirExists = fs.existsSync(DATA_DIR)
+
+// Si data/ no existe, generar estado vacío
+if (!dataDirExists) {
+  console.log('data/ directory does not exist. Generating empty state.')
+  const emptyPrices = []
+  fs.mkdirSync(PUBLIC_DATA_DIR, { recursive: true })
+  fs.writeFileSync(PRICES_OUTPUT, JSON.stringify(emptyPrices, null, 2))
+  console.log('Generated prices.json with 0 products (empty state)')
+  process.exit(0)
+}
+
+// Leer history.csv
 try {
   const historyContent = fs.readFileSync(HISTORY_FILE, 'utf-8')
   historyRows = parseCSV(historyContent).filter(r => r.fecha && r.sku)
+  console.log(`Read ${historyRows.length} rows from history.csv`)
 } catch (e) {
   console.warn('No se pudo leer history.csv', e.message)
+  historyRows = []
 }
 
 // Leer products.json
-let products = {}
 try {
   const productsContent = fs.readFileSync(PRODUCTS_FILE, 'utf-8')
   products = JSON.parse(productsContent)
+  console.log(`Read ${Object.keys(products).length} products from products.json`)
 } catch (e) {
   console.warn('No se pudo leer products.json', e.message)
+  products = {}
 }
 
-// Determinar si hay suficientes datos históricos
-const fechas = [...new Set(historyRows.map(r => r.fecha))].sort()
-const hasSufficientHistory = fechas.length >= 3
+// Determinar fechas únicas en el historial
+const allFechas = [...new Set(historyRows.map(r => r.fecha))].sort()
+const numDiasHistorial = allFechas.length
 
-// Determinar si hay productos reales
-const productKeys = Object.keys(products)
-const hasRealProducts = productKeys.length > 0
+// Obtener lista de SKU reales (union de products.json y history.csv)
+const skuSetFromProducts = Object.keys(products).filter(sku => products[sku] && products[sku].name)
+const skuSetFromHistory = [...new Set(historyRows.map(r => r.sku))]
+const allSkus = [...new Set([...skuSetFromProducts, ...skuSetFromHistory])]
 
-// Decidir la estrategia de datos
-let pricesData = []
+console.log(`Total de SKU a procesar: ${allSkus.length}`)
 
-if (!hasRealProducts) {
-  // No hay productos en data/ - usar datos de muestra deterministas
-  console.log('No hay productos en data/. Usando datos de muestra deterministas.')
+// Construir precios para TODOS los productos reales
+const pricesData = []
 
-  const sampleProductName = 'PcCom Imperial AMD Ryzen 7 5700X / RTX 5070 / Windows 11 Home'
-  const sampleSku = '11011276'
+for (const sku of allSkus) {
+  const product = products[sku]
+  const name = product ? product.name : null
 
-  pricesData = [
-    {
-      sku: sampleSku,
-      name: sampleProductName,
-      currentPrice: 1799.0,
-      previousPrice: 2299.0,
-      discount: 22,
-      attributes: extractAttributes(sampleProductName),
-      minPriceHistorico: Math.round(1799 * 0.7),
-      maxPriceHistorico: Math.round(1799 * 1.3),
+  if (!name) {
+    // Producto en history.csv pero sin nombre en products.json - saltarlo
+    // Per requirements: never invent products, so skip
+    continue
+  }
+
+  // Filtrar rows de histórico para este SKU (todos los registros reales)
+  const skuRows = historyRows.filter(r => r.sku === sku).sort(function (a, b) { return new Date(a.fecha) - new Date(b.fecha) })
+
+  if (skuRows.length === 0) {
+    // SKU en products.json pero sin histórico - incluir con precio actual null
+    pricesData.push({
+      sku,
+      name,
+      currentPrice: null,
+      previousPrice: null,
+      discount: null,
+      minPriceHistorico: null,
+      maxPriceHistorico: null,
       variation7d: 0,
-      totalRegistros: 1,
-      esMuestra: true,
-      motivoMuestra: 'Historial de ejemplo: menos de 3 días de datos históricos. No hay datos reales disponibles.',
+      totalRegistros: 0,
+      attributes: extractAttributes(name),
       hito: null,
-      datosReales: false,
-    },
-  ]
-} else if (!hasSufficientHistory) {
-  // Hay productos reales pero menos de 3 días de historial
-  // Mostrar productos reales con aviso
-  console.log(`Solo ${fechas.length} día(s) histórico. Mostrando productos reales con aviso.`)
-
-  for (const sku of productKeys) {
-    const product = products[sku]
-    const name = product ? product.name : `Producto ${sku}`
-
-    if (!name) continue
-
-    // Filtrar rows de histórico para este SKU
-    const skuRows = historyRows.filter(r => r.sku === sku)
-
-    // Extraer precios de la columna 'precio'
-    const prices = skuRows.map(r => parsePrice(r.precio)).filter(p => p !== null)
-
-    // Precios anteriores (PVPR) de la columna 'precio_anterior'
-    const preciosAnteriores = skuRows.filter(r => r.precio_anterior).map(r => parsePrice(r.precio_anterior)).filter(p => p !== null)
-
-    // Descuentos de la columna 'descuento'
-    const descuentos = skuRows.filter(r => r.descuento).map(r => {
-      const d = parseInt(r.descuento, 10)
-      return !isNaN(d) ? d : null
-    }).filter(d => d !== null)
-
-    const currentPrice = prices[prices.length - 1] || null
-    const minPriceHistorico = prices.length > 0 ? Math.min(...prices) : null
-    const maxPriceHistorico = prices.length > 0 ? Math.max(...prices) : null
-    const discountActual = descuentos.length > 0 ? Math.max(...descuentos) : null
-
-    // Extraer atributos del nombre
-    const attributes = extractAttributes(name)
-
-    // Detectar el hito más reciente
-    const hitoMasRecente = skuRows.filter(r => r.fecha).sort(function (a, b) { return new Date(a.fecha) - new Date(b.fecha) }).reverse()[0]
-    const hitoInfo = hitoMasRecente ? isHito(hitoMasRecente.fecha) : null
-
-    pricesData.push({
-      sku,
-      name,
-      currentPrice,
-      previousPrice: prices.length > 1 ? prices[prices.length - 2] : null,
-      discount: discountActual,
-      minPriceHistorico,
-      maxPriceHistorico,
-      variation7d: get7dVariation(currentPrice || 0, prices),
-      totalRegistros: skuRows.length,
-      attributes,
-      hito: hitoInfo,
       esMuestra: false,
       motivoMuestra: '',
       datosReales: true,
-      muestraAviso: true, // Flag para mostrar aviso de historial corto
+      showHistoryNote: false,
+      numDiasHistorial: 0,
     })
+    continue
   }
-} else {
-  // Suficiente historial (≥ 3 días) - mostrar datos reales completos
-  console.log(`${productKeys.length} productos con historial suficiente (≥ 3 días)`)
 
-  for (const sku of productKeys) {
-    const product = products[sku]
-    const name = product ? product.name : `Producto ${sku}`
+  // Extraer precios de la columna 'precio'
+  const prices = skuRows.map(r => parsePrice(r.precio)).filter(p => p !== null)
 
-    if (!name) continue
+  // Precios anteriores (PVPR) de la columna 'precio_anterior'
+  const preciosAnteriores = skuRows.filter(r => r.precio_anterior).map(r => parsePrice(r.precio_anterior)).filter(p => p !== null)
 
-    // Filtrar rows de histórico para este SKU
-    const skuRows = historyRows.filter(r => r.sku === sku).sort(function (a, b) { return new Date(a.fecha) - new Date(b.fecha) })
+  // Descuentos de la columna 'descuento'
+  const descuentos = skuRows.filter(r => r.descuento).map(r => {
+    const d = parseInt(r.descuento, 10)
+    return !isNaN(d) ? d : null
+  }).filter(d => d !== null)
 
-    // Extraer precios de la columna 'precio'
-    const prices = skuRows.map(r => parsePrice(r.precio)).filter(p => p !== null)
+  const currentPrice = prices[prices.length - 1] || null
+  const minPriceHistorico = prices.length > 0 ? Math.min(...prices) : null
+  const maxPriceHistorico = prices.length > 0 ? Math.max(...prices) : null
+  const discountActual = descuentos.length > 0 ? Math.max(...descuentos) : null
+  const dropPorcentaje = currentPrice && maxPriceHistorico && maxPriceHistorico > currentPrice
+    ? Math.round(((maxPriceHistorico - currentPrice) / maxPriceHistorico) * 100)
+    : 0
 
-    // Precios anteriores (PVPR) de la columna 'precio_anterior'
-    const preciosAnteriores = skuRows.filter(r => r.precio_anterior).map(r => parsePrice(r.precio_anterior)).filter(p => p !== null)
+  const variation7d = prices.length > 1 ? Math.round(((prices[prices.length - 1] || 0) - prices[0]) / prices[0] * 100) : 0
+  const totalRegistros = skuRows.length
 
-    // Descuentos de la columna 'descuento'
-    const descuentos = skuRows.filter(r => r.descuento).map(r => {
-      const d = parseInt(r.descuento, 10)
-      return !isNaN(d) ? d : null
-    }).filter(d => d !== null)
+  // Detectar el hito más reciente
+  const hitoMasRecente = skuRows.filter(r => r.fecha).sort(function (a, b) { return new Date(a.fecha) - new Date(b.fecha) }).reverse()[0]
+  const hitoInfo = hitoMasRecente ? isHito(hitoMasRecente.fecha) : null
 
-    const currentPrice = prices[prices.length - 1] || null
-    const minPriceHistorico = prices.length > 0 ? Math.min(...prices) : null
-    const maxPriceHistorico = prices.length > 0 ? Math.max(...prices) : null
-    const discountActual = descuentos.length > 0 ? Math.max(...descuentos) : null
-    const dropPorcentaje = currentPrice && maxPriceHistorico && maxPriceHistorico > currentPrice
-      ? Math.round(((maxPriceHistorico - currentPrice) / maxPriceHistorico) * 100)
-      : 0
+  // Determinar si mostrar nota de historial en construcción
+  const showHistoryNote = numDiasHistorial < 3
 
-    const variation7d = get7dVariation(currentPrice || 0, prices)
-    const totalRegistros = skuRows.length
-
-    // Extraer atributos del nombre
-    const attributes = extractAttributes(name)
-
-    // Detectar el hito más reciente
-    const hitoMasRecente = skuRows.filter(r => r.fecha).sort(function (a, b) { return new Date(a.fecha) - new Date(b.fecha) }).reverse()[0]
-
-    const hitoInfo = hitoMasRecente ? isHito(hitoMasRecente.fecha) : null
-
-    pricesData.push({
-      sku,
-      name,
-      currentPrice,
-      previousPrice: prices.length > 1 ? prices[prices.length - 2] : null,
-      discount: discountActual,
-      minPriceHistorico,
-      maxPriceHistorico,
-      variation7d,
-      totalRegistros,
-      attributes,
-      hito: hitoInfo,
-      esMuestra: false,
-      motivoMuestra: '',
-      datosReales: true,
-      muestraAviso: false,
-    })
-  }
+  pricesData.push({
+    sku,
+    name,
+    currentPrice,
+    previousPrice: prices.length > 1 ? prices[prices.length - 2] : null,
+    discount: discountActual,
+    minPriceHistorico,
+    maxPriceHistorico,
+    variation7d,
+    totalRegistros,
+    attributes: extractAttributes(name),
+    hito: hitoInfo,
+    esMuestra: false,
+    motivoMuestra: '',
+    datosReales: true,
+    showHistoryNote, // Flag para mostrar "Historial en construcción"
+    numDiasHistorial, // Número real de días de historial
+  })
 }
 
 // Ordenar por SKU
@@ -329,12 +264,9 @@ fs.mkdirSync(PUBLIC_DATA_DIR, { recursive: true })
 
 // Escribir fichero
 fs.writeFileSync(PRICES_OUTPUT, JSON.stringify(pricesData, null, 2))
-console.log(`Generated prices.json con ${pricesData.length} productos ${hasRealProducts ? '(datos reales)' : '(muestra determinista)'}`)
+console.log(`Generated prices.json con ${pricesData.length} productos (datos reales)`)
 
 // Output summary
-const realCount = pricesData.filter(p => p.datosReales).length
-const sampleCount = pricesData.filter(p => p.esMuestra).length
-const cortoCount = pricesData.filter(p => p.muestraAviso).length
-console.log(` - Productos reales: ${realCount}`)
-console.log(` - Datos de muestra: ${sampleCount}`)
-console.log(` - Con aviso de historial corto: ${cortoCount}`)
+const withNote = pricesData.filter(p => p.showHistoryNote).length
+console.log(` - Productos con historial < 3 días: ${withNote}`)
+console.log(` - Primer SKU: ${pricesData[0]?.sku}, Último SKU: ${pricesData[pricesData.length - 1]?.sku}`)
