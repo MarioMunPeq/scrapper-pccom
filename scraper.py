@@ -106,7 +106,7 @@ CARD_SELECTOR = f"{GRID_SELECTOR} a[data-product-id]"
 # Extracción en el navegador
 # ---------------------------------------------------------------------------
 
-EXTRACT_JS = """
+EXTRACT_JS = r"""
 (cards) => cards.map((card) => {
   const query = (selector) => card.querySelector(selector);
   const delivery = query('[data-testid="product-card-delivery"]');
@@ -117,7 +117,7 @@ EXTRACT_JS = """
 
   return {
     sku: card.getAttribute('data-product-id') || '',
-    name: nameEl.getAttribute('data-product-name') || card.getAttribute('data-product-name') || '',
+    name: nameEl?.getAttribute('data-product-name') || card.getAttribute('data-product-name') || '',
     url: card.href || '',
     price: card.getAttribute('data-product-price')
       || (price ? price.textContent : ''),
@@ -847,7 +847,7 @@ def scrape():
 
             while pages_scraped < MAX_PAGES:
                 # Extraer productos de la página actual usando el JS de extracción
-                cards = page.locator(CARD_SELECTOR).all()
+                cards = page.locator(CARD_SELECTOR).element_handles()
                 card_count = len(cards)
                 if card_count == 0:
                     break
