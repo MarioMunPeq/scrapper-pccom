@@ -1,25 +1,38 @@
 import yaml
+import os
 
-with open('.github/workflows/scrape.yml', 'r', encoding='utf-8') as f:
-    scrape = yaml.safe_load(f)
-with open('.github/workflows/deploy-web.yml', 'r', encoding='utf-8') as f:
+# Validar workflow de deploy (scrape.yml ha sido migrado a ejecución manual en PC)
+deploy_path = os.path.join(os.path.dirname(__file__), '..', '..', '..', '..',
+                           '.github', 'workflows', 'deploy-web.yml')
+with open(deploy_path, 'r', encoding='utf-8') as f:
     deploy = yaml.safe_load(f)
 
-print("Scrape keys:", list(scrape.keys()))
 print("Deploy keys:", list(deploy.keys()))
-print("Scrape name:", scrape.get('name'))
+print("Deploy name:", deploy.get('name'))
 
 deploy_on = deploy.get('on', {})
 print("Deploy on keys:", list(deploy_on.keys()))
+
+# Verificar que no haya workflow_run (debe haberse eliminado)
 wr = deploy_on.get('workflow_run')
 if wr:
-    print("Deploy workflow_run found:")
+    print("⚠️  WARNING: workflow_run aún presente en deploy-web.yml")
     print("  workflows:", wr.get('workflows'))
     print("  types:", wr.get('types'))
-
-scrape_name = scrape.get('name')
-if scrape_name and wr:
-    match = scrape_name in wr.get('workflows', [])
-    print(f"Scrape name '{scrape_name}' in deploy workflows: {match}")
 else:
-    print("No se pudo verificar la coincidencia")
+    print("✅  Ningún workflow_run en deploy-web.yml (correcto)")
+
+# Verificar triggers esperados
+has_push = 'push' in deploy_on
+has_dispatch = 'workflow_dispatch' in deploy_on
+print(f"  push trigger: {'✅' if has_push else '❌'}")
+print(f"  workflow_dispatch trigger: {'✅' if has_dispatch else '❌'}")
+
+# Verificar paths
+push_paths = deploy_on.get('push', {}).get('paths', [])
+has_web = any(p.startswith('web/') for p in push_paths)
+has_data = any(p.startswith('data/') for p in push_paths)
+has_own_workflow = any('.github/workflows/deploy-web.yml' in p for p in push_paths)
+print(f"  paths web/**: {'✅' if has_web else '❌'}")
+print(f"  paths data/**: {'✅' if has_data else '❌'}")
+print(f"  paths own workflow: {'✅' if has_own_workflow else '❌'}")

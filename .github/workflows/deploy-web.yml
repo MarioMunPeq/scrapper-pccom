@@ -5,11 +5,9 @@ on:
     branches: [main]
     paths:
       - web/**
+      - data/**
       - .github/workflows/deploy-web.yml
   workflow_dispatch:
-  workflow_run:
-    workflows: ["pc-price-tracker"]
-    types: [completed]
 
 concurrency:
   group: pages
