@@ -343,6 +343,9 @@ def wait_for_listing(page, response) -> str | None:
             break
         page.wait_for_timeout(1_000)
 
+    # Ya no llamamos a detect_block aquí porque detect_block ya maneja el caso
+    # de "grid presente = no hay bloqueo". Si llegamos aquí, es que el grid
+    # aún no apareció; consultamos detect_block para decidir si es bloqueo real.
     reason = detect_block(page, response)
     if reason:
         return (
@@ -357,11 +360,45 @@ def wait_for_listing(page, response) -> str | None:
 
 def detect_block(page, response) -> str | None:
     """Devuelve el motivo si la página parece un bloqueo/captcha, si no None."""
+    # Bloqueo por código HTTP
     if response is not None and response.status in (403, 429, 503):
         return f"HTTP {response.status}"
 
     try:
         title = page.title().lower()
+    except PlaywrightError:
+        return None
+
+    # Si el grid de productos ya está visible, no es un bloqueoaunque haya marcos de Cloudflare
+    try:
+        grid_visible = page.locator(CARD_SELECTOR).count() > 0
+    except PlaywrightError:
+        grid_visible = False
+
+    if grid_visible:
+        return None  # El listado está presente, no hay bloqueo
+
+    # Posible página de desafío: título de reto y grid no visible
+    challenge_titles = ["just a moment", "attention required", "un momento"]
+    title_lower = title.strip().lower()
+    is_challenge_title = any(t in title_lower for t in challenge_titles)
+
+    if is_challenge_title:
+        # Guardar captura y HTML para depuración
+        try:
+            debug_dir = Path("debug")
+            debug_dir.mkdir(exist_ok=True)
+            timestamp = time.strftime("%Y%m%d-%H%M%S")
+            page.screenshot(path=debug_dir / f"block-{timestamp}.png")
+            (debug_dir / f"block-{timestamp}.html").write_text(
+                page.content(), encoding="utf-8", newline=""
+            )
+        except Exception:
+            pass
+        return "desafío de Cloudflare / captcha detectado"
+
+    # Fallback: revisar marcadores clásicos solo si no hay grid
+    try:
         body = page.locator("body").inner_text(timeout=5_000).lower()
     except PlaywrightError:
         return None
@@ -369,7 +406,18 @@ def detect_block(page, response) -> str | None:
     haystack = f"{title}\n{body}"
     for marker in BLOCK_MARKERS:
         if marker in haystack:
-            return f"marcador «{marker}»"
+            # Guardar captura y HTML para depuración
+            try:
+                debug_dir = Path("debug")
+                debug_dir.mkdir(exist_ok=True)
+                timestamp = time.strftime("%Y%m%d-%H%M%S")
+                page.screenshot(path=debug_dir / f"block-{timestamp}.png")
+                (debug_dir / f"block-{timestamp}.html").write_text(
+                    page.content(), encoding="utf-8", newline=""
+                )
+            except Exception:
+                pass
+            return f"marcador de bloqueo «{marker}»"
 
     if len(body) < 500:
         return "respuesta vacía o demasiado corta"
