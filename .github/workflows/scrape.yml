@@ -1,14 +1,9 @@
 name: pc-price-tracker
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - scraper.py
-      - requirements.txt
-      - .github/workflows/scrape.yml
   schedule:
     - cron: "0 11 * * *"
+    - cron: "0 17 * * *"
   workflow_dispatch:
 
 concurrency:
@@ -32,6 +27,18 @@ jobs:
         with:
           clean: false
 
+      - name: Verificar datos actuales
+        run: |
+          if (Test-Path data/history.csv) {
+            $today = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd")
+            $count = (Get-Content data/history.csv | Where-Object { $_ -match "^${today}," }).Count
+            if ($count -gt 0) {
+              Write-Output "Datos de hoy ya presentes en history.csv (${count} filas). Scrape omitido."
+              exit 0
+            }
+          }
+          Write-Output "Continuando con scrape programado..."
+
       - name: Preparar entorno
         run: |
           if (-not (Test-Path .venv)) {
@@ -45,6 +52,7 @@ jobs:
 
       - name: Ejecutar scraper
         run: |
+          $env:PYTHONIOENCODING = "utf-8"
           .\.venv\Scripts\python.exe scraper.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 

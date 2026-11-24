@@ -11,4 +11,5 @@ actions-runner/
 .venv/
 __pycache__/
 *.py[cod]
+browser-profile/
 debug/

@@ -33,6 +33,8 @@ from pathlib import Path
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
+import subprocess
+import shutil
 
 # ---------------------------------------------------------------------------
 # Configuración
@@ -53,10 +55,15 @@ MIN_DELAY_SECONDS = 2.0
 MAX_DELAY_SECONDS = 5.0
 MAX_PAGES = 30  # tope de seguridad por si la paginación se comporta raro
 
-# Cloudflare puede mostrar un reto automático ("Un momento…"). Con el Chromium
-# completo suele resolverse solo en unos segundos. Le damos margen antes de
-# considerar que es un bloqueo real.
-CHALLENGE_WAIT_SECONDS = 15
+# Chrome real instalado en el PC (fallback a Chromium si no existe).
+# Se usa launch_persistent_context con un perfil conservador de cookies.
+CHROME_CHANNEL = "chrome"  # "chrome" o "chromium"; usa el installed Chrome si está disponible.
+
+# Cloudflare puede mostrar un reto automático ("Un momento…"). Esperamos hasta 45 s
+# a que se resuelva solo (título "Just a moment" / "Un momento" que desaparece, o
+# aparece #product-listing-product-grid). Solo es bloqueo real si pasado ese tiempo
+# sigue el reto.
+CHALLENGE_WAIT_SECONDS = 45
 
 # Marcadores de bloqueo/captcha que aparecen en el título o cuerpo de la página.
 # Se utilizan en detect_block() para identificar páginas de Cloudflare o errores.
@@ -857,6 +864,208 @@ def print_results(
         print("\nNo se encontró ningún PC con RTX 5070 en el listado.")
 
 
+def _chrome_path():
+    """Devuelve la ruta al chrome.exe si está instalado, None en caso contrario."""
+    chrome_exe = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+    chrome_exe_x86 = r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
+    if os.path.isfile(chrome_exe):
+        return chrome_exe
+    if os.path.isfile(chrome_exe_x86):
+        return chrome_exe_x86
+    fallback = shutil.which("chromium") or shutil.which("chrome")
+    if fallback:
+        return fallback
+    return None
+
+
+def _launch_browser(p):
+    """Lanza Chrome real (channel="chrome") con fallback a Chromium.
+    Usa persistent context con perfil .browser-profile/ para conservar cookies."""
+    chrome_exe = _chrome_path()
+    user_data_dir = Path(".browser-profile").resolve()
+
+    if chrome_exe and "chrome" in chrome_exe.lower():
+        browser = p.chromium.launch(headless=HEADLESS, channel="chrome")
+    else:
+        browser = p.chromium.launch(headless=HEADLESS)
+
+    context = browser.new_context(
+        user_data_dir=user_data_dir,
+        user_agent=USER_AGENT,
+        locale=LOCALE,
+        timezone_id=TIMEZONE,
+    )
+    page = context.new_page()
+    return browser, context, page
+
+
+def _resolve_cloudflare_challenge(page, response) -> str | None:
+    """
+    Espera hasta CHALLENGE_WAIT_SECONDS a que se resuelva el reto de Cloudflare.
+    Devuelve None si el listado quedó disponible, o un mensaje de error si sigue bloqueado.
+
+    Lógica:
+    - Si aparece #product-listing-product-grid → no hay bloqueo, devuelve None
+    - Si el título es "Just a moment" / "Un momento" y luego desaparece → no hay bloqueo, devuelve None
+    - Si passed el timeout y sigue el título de reto → es bloqueo real, guarda debug y devuelve mensaje
+    """
+    deadline = time.monotonic() + CHALLENGE_WAIT_SECONDS
+
+    while time.monotonic() < deadline:
+        # Verificar si el grid de productos ya está visible
+        try:
+            if page.locator(CARD_SELECTOR).count() > 0:
+                # Grid presente = listado disponible, no hay bloqueo
+                return None
+        except PlaywrightError:
+            pass
+
+        # Verificar título de la página
+        try:
+            title = page.title().lower().strip()
+        except PlaywrightError:
+            title = ""
+
+        challenge_titles = ["just a moment", "attention required", "un momento"]
+        is_challenge_title = any(t in title for t in challenge_titles)
+
+        if is_challenge_title:
+            # El título de reto está presente todavía, esperar un poco más
+            page.wait_for_timeout(1_000)
+            continue
+
+        # Si el título ya no es de desafío, volver a verificar el grid
+        try:
+            if page.locator(CARD_SELECTOR).count() > 0:
+                return None
+        except PlaywrightError:
+            pass
+
+        page.wait_for_timeout(1_000)
+
+    # Si llegamos aquí, el timeout de 45 s se cumplió y el reto sigue activo
+    # Guardar captura y HTML para depuración
+    debug_dir = Path("debug")
+    debug_dir.mkdir(exist_ok=True)
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    try:
+        page.screenshot(path=debug_dir / f"block-{timestamp}.png")
+    except Exception:
+        pass
+    try:
+        (debug_dir / f"block-{timestamp}.html").write_text(
+            page.content(), encoding="utf-8", newline=""
+        )
+    except Exception:
+        pass
+    return f"desafío de Cloudflare no resuelto transcurrido {CHALLENGE_WAIT_SECONDS} s"
+
+
+def detect_block(page, response) -> str | None:
+    """Devuelve el motivo si la página parece un bloqueo/captcha, si no None."""
+    # Bloqueo por código HTTP
+    if response is not None and response.status in (403, 429, 503):
+        return f"HTTP {response.status}"
+
+    try:
+        title = page.title().lower()
+    except PlaywrightError:
+        return None
+
+    # Si el grid de productos ya está visible, no es un bloqueo aunque haya marcos de Cloudflare
+    try:
+        grid_visible = page.locator(CARD_SELECTOR).count() > 0
+    except PlaywrightError:
+        grid_visible = False
+
+    if grid_visible:
+        return None  # El listado está presente, no hay bloqueo
+
+    # Desafío de Cloudflare: intentar resolución automática (ya hizo _resolve_cloudflare_challenge arriba)
+    # Si aún aparece como título de desafío tras el timeout, tratarlo como bloqueo
+    challenge_titles = ["just a moment", "attention required", "un momento"]
+    title_lower = title.strip().lower()
+    is_challenge_title = any(t in title_lower for t in challenge_titles)
+
+    if is_challenge_title:
+        # Guardar captura y HTML para depuración
+        try:
+            debug_dir = Path("debug")
+            debug_dir.mkdir(exist_ok=True)
+            timestamp = time.strftime("%Y%m%d-%H%M%S")
+            page.screenshot(path=debug_dir / f"block-{timestamp}.png")
+            (debug_dir / f"block-{timestamp}.html").write_text(
+                page.content(), encoding="utf-8", newline=""
+            )
+        except Exception:
+            pass
+        return "desafío de Cloudflare / captcha detectado"
+
+    # Fallback: revisar marcadores clásicos solo si no hay grid
+    try:
+        body = page.locator("body").inner_text(timeout=5_000).lower()
+    except PlaywrightError:
+        return None
+
+    haystack = f"{title}\n{body}"
+    for marker in BLOCK_MARKERS:
+        if marker in haystack:
+            # Guardar captura y HTML para depuración
+            try:
+                debug_dir = Path("debug")
+                debug_dir.mkdir(exist_ok=True)
+                timestamp = time.strftime("%Y%m%d-%H%M%S")
+                page.screenshot(path=debug_dir / f"block-{timestamp}.png")
+                (debug_dir / f"block-{timestamp}.html").write_text(
+                    page.content(), encoding="utf-8", newline=""
+                )
+            except Exception:
+                pass
+            return f"marcador de bloqueo «{marker}»"
+
+    if len(body) < 500:
+        return "respuesta vacía o demasiado corta"
+
+    return None
+
+
+def wait_for_listing(page, response) -> str | None:
+    """
+    Espera a que aparezcan las tarjetas. Devuelve None si el listado está
+    disponible o un mensaje de error si sigue bloqueado / no hay listado.
+    """
+    # Primero, intentar resolver el reto de Cloudflare automáticamente por hasta 45 s
+    result = _resolve_cloudflare_challenge(page, response)
+    if result is not None:
+        # Desafío no resuelto tras el timeout → bloqueo real
+        raise ScraperError(result)
+
+    # Si llegamos aquí, el listado ya apareció o se resolvió solo
+    # Ahora esperar confirmación del grid (debe aparecer casi inmediatamente)
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        try:
+            if page.locator(CARD_SELECTOR).count() > 0:
+                return None
+        except PlaywrightError:
+            pass
+        page.wait_for_timeout(500)
+
+    # Ya no llamamos a detect_block aquí porque detect_block ya maneja el caso
+    # de "grid presente = no hay bloqueo". Si llegamos aquí, es que el grid
+    # aún no apareció; consultamos detect_block para decidir si es bloqueo real.
+    reason = detect_block(page, response)
+    if reason:
+        return (
+            "Posible bloqueo o captcha detectado "
+            f"({reason}). Se detiene la ejecución."
+        )
+    return (
+        "No se encontraron tarjetas de producto. "
+        "Puede que la web haya cambiado su estructura."
+    )
+
+
 def scrape():
     """Ejecuta el scrapeo completo de la lista de productos de RTX 5070.
 
@@ -874,85 +1083,91 @@ def scrape():
 
     from playwright.sync_api import sync_playwright
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=HEADLESS)
-        context = browser.new_context(
-            user_agent=USER_AGENT,
-            locale=LOCALE,
-            timezone_id=TIMEZONE,
-        )
-        page = context.new_page()
+    browser, context, page = _launch_browser(p)
 
-        try:
-            page.goto(BASE_URL)
-            # Esperar a que aparezcan las tarjetas o que haya bloqueo
+    try:
+        page.goto(BASE_URL)
+        # Esperar a que aparezcan las tarjetas o que haya bloqueo
+        result = wait_for_listing(page, None)
+        if result is not None:
+            raise ScraperError(result)
+
+        pages_scraped = 1
+
+        while pages_scraped < MAX_PAGES:
+            # Extraer productos de la página actual usando el JS de extracción
+            cards = page.locator(CARD_SELECTOR).element_handles()
+            card_count = len(cards)
+            if card_count == 0:
+                break
+
+            # Ejecutar extracción en todas las tarjetas a la vez
+            card_data_list = page.evaluate(EXTRACT_JS, cards)
+
+            for i in range(card_count):
+                card_data = card_data_list[i]
+                try:
+                    # Parse price and previous_price
+                    price = parse_price(card_data.get('price'))
+                    previous_price = parse_price(card_data.get('previous_price'))
+
+                    # Build specifications from name
+                    specs = extract_specifications(card_data.get('card_text') or '')
+
+                    # Build Product object
+                    product = build_product(
+                        card_data,
+                        specs,
+                    )
+
+                    if product is not None:
+                        if product.name.lower().find('ti') >= 0 or product.gpu.lower().find('ti') >= 0:
+                            ti_products.append(product)
+                        else:
+                            products.append(product)
+                except Exception:
+                    skipped.append(card_data.get('sku', 'unknown') or f'card-{i}')
+                    continue
+
+            # Intentar navegar a la siguiente página
+            next_url = next_page_url(page)
+            if next_url is None:
+                break
+
+            page.goto(next_url)
+            pages_scraped += 1
+
+            # Verificar bloqueo en la página siguiente
             result = wait_for_listing(page, None)
             if result is not None:
-                browser.close()
                 raise ScraperError(result)
 
-            pages_scraped = 1
-
-            while pages_scraped < MAX_PAGES:
-                # Extraer productos de la página actual usando el JS de extracción
-                cards = page.locator(CARD_SELECTOR).element_handles()
-                card_count = len(cards)
-                if card_count == 0:
-                    break
-
-                # Ejecutar extracción en todas las tarjetas a la vez
-                card_data_list = page.evaluate(EXTRACT_JS, cards)
-
-                for i in range(card_count):
-                    card_data = card_data_list[i]
-                    try:
-                        # Parse price and previous_price
-                        price = parse_price(card_data.get('price'))
-                        previous_price = parse_price(card_data.get('previous_price'))
-
-                        # Build specifications from name
-                        specs = extract_specifications(card_data.get('card_text') or '')
-
-                        # Build Product object
-                        product = build_product(
-                            card_data,
-                            specs,
-                        )
-
-                        if product is not None:
-                            if product.name.lower().find('ti') >= 0 or product.gpu.lower().find('ti') >= 0:
-                                ti_products.append(product)
-                            else:
-                                products.append(product)
-                    except Exception:
-                        skipped.append(card_data.get('sku', 'unknown') or f'card-{i}')
-                        continue
-
-                # Intentar navegar a la siguiente página
-                next_url = next_page_url(page)
-                if next_url is None:
-                    break
-
-                page.goto(next_url)
-                pages_scraped += 1
-
-                # Verificar bloqueo en la página siguiente
-                result = wait_for_listing(page, None)
-                if result is not None:
-                    browser.close()
-                    raise ScraperError(result)
-
-        except ScraperError:
-            raise
-        except Exception as e:
-            browser.close()
-            raise ScraperError(
-                f"Error durante el scrapeo: {e}",
-                products=products,
-                ti_products=ti_products,
-                skipped=skipped,
-                pages_scraped=pages_scraped,
+    except ScraperError:
+        raise
+    except Exception as e:
+        # Si hay error inesperado, guardar debug antes de cerrar
+        try:
+            debug_dir = Path("debug")
+            debug_dir.mkdir(exist_ok=True)
+            timestamp = time.strftime("%Y%m%d-%H%M%S")
+            page.screenshot(path=debug_dir / f"block-{timestamp}.png")
+            (debug_dir / f"block-{timestamp}.html").write_text(
+                page.content(), encoding="utf-8", newline=""
             )
+        except Exception:
+            pass
+        raise ScraperError(
+            f"Error durante el scrapeo: {e}",
+            products=products,
+            ti_products=ti_products,
+            skipped=skipped,
+            pages_scraped=pages_scraped,
+        )
+    finally:
+        try:
+            browser.close()
+        except Exception:
+            pass
 
     return products, ti_products, skipped, pages_scraped
 
