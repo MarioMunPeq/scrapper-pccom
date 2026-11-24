@@ -647,13 +647,40 @@ def scrape():
 
     with sync_playwright() as p:
         browser, context, page = _launch_browser(p)
+        start_time = time.monotonic()
+
+        print(f"[{time.strftime('%H:%M:%S')}] ✅ Navegador abierto headless")
 
         try:
-            page.goto(BASE_URL)
+            print(f"[{time.strftime('%H:%M:%S')}] 📄 Cargando página principal: {BASE_URL}")
+            page.goto(BASE_URL, timeout=45_000)
             # Esperar a que aparezcan las tarjetas o que haya bloqueo
+            if time.monotonic() - start_time > 480:
+                print(f"[{time.strftime('%H:%M:%S')}] ⏰ Límite global de 8 minutos alcanzado")
+                # Guardar debug antes de detener
+                try:
+                    debug_dir = Path("debug")
+                    debug_dir.mkdir(exist_ok=True)
+                    ts = time.strftime("%Y%m%d-%H%M%S")
+                    page.screenshot(path=debug_dir / f"block-{ts}.png")
+                    (debug_dir / f"block-{ts}.html").write_text(
+                        page.content(), encoding="utf-8", newline=""
+                    )
+                except Exception:
+                    pass
+                raise ScraperError(
+                    "Límite global de 8 minutos alcanzado",
+                    products=products,
+                    ti_products=ti_products,
+                    skipped=skipped,
+                    pages_scraped=pages_scraped,
+                )
+
             result = wait_for_listing(page, None)
             if result is not None:
                 raise ScraperError(result)
+
+            print(f"[{time.strftime('%H:%M:%S')}] 📄 Página principal cargada, esperando reto")
 
             pages_scraped = 1
 
@@ -690,7 +717,29 @@ def scrape():
                     if next_url is None:
                         break
 
-                    page.goto(next_url)
+                    if time.monotonic() - start_time > 480:
+                        print(f"[{time.strftime('%H:%M:%S')}] ⏰ Límite global de 8 minutos alcanzado")
+                        # Guardar debug antes de detener
+                        try:
+                            debug_dir = Path("debug")
+                            debug_dir.mkdir(exist_ok=True)
+                            ts = time.strftime("%Y%m%d-%H%M%S")
+                            page.screenshot(path=debug_dir / f"block-{ts}.png")
+                            (debug_dir / f"block-{ts}.html").write_text(
+                                page.content(), encoding="utf-8", newline=""
+                            )
+                        except Exception:
+                            pass
+                        raise ScraperError(
+                            "Límite global de 8 minutos alcanzado",
+                            products=products,
+                            ti_products=ti_products,
+                            skipped=skipped,
+                            pages_scraped=pages_scraped,
+                        )
+
+                    print(f"[{time.strftime('%H:%M:%S')}] 📄 Cargando página {pages_scraped + 1}")
+                    page.goto(next_url, timeout=45_000)
                     pages_scraped += 1
 
                     # Verificar bloqueo en la siguiente página

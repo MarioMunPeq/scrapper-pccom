@@ -16,11 +16,13 @@ permissions:
 defaults:
   run:
     shell: pwsh
+    env:
+      PYTHONUNBUFFERED: "1"
 
 jobs:
   scrape:
     runs-on: [self-hosted, Windows]
-    timeout-minutes: 30
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
