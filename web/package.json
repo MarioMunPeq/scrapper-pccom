@@ -3,15 +3,19 @@
   "private": true,
   "version": "1.0.0",
   "scripts": {
-    "build": "node scripts/build-prices.js && vite build"
+    "build": "node scripts/build-prices.js && tsc --noEmit && vite build",
+    "preview": "vite preview"
   },
   "dependencies": {
     "gsap": "^3.15.1"
   },
   "devDependencies": {
+    "@types/react": "^18.3.31",
+    "@types/react-dom": "^18.3.7",
     "@vitejs/plugin-react": "^6.3.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
+    "typescript": "^7.0.2",
     "vite": "^8.3.8"
   }
 }

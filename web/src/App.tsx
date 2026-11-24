@@ -153,7 +153,7 @@ function PriceBadge({ changePct }: { changePct: number | null }) {
 // COMPONENT: ProductCard - Tarjeta de producto en listing
 // ============================================================
 
-function ProductCard({ p }: { p: any }) {
+function ProductCard({ p, timeRange }: { p: any; timeRange: string }) {
   const changePct = p.priceChangePct !== undefined ? p.priceChangePct : p.discount !== null ? p.discount : null
   const isDrop = changePct > 0 || (p.previousPrice && p.previousPrice > p.currentPrice)
 
@@ -234,13 +234,17 @@ function ProductCard({ p }: { p: any }) {
   return (
     <div className={cardClasses.join(' ')} key={p.sku} aria-label={p.name}>
       <div className="product-card-image-wrapper">
-        <img
-          className="product-card-image"
-          src={p.image_url || '/favicon.ico'}
-          alt={p.name}
-          loading="lazy"
-          onError={(e: any) => { e.target.src = '/favicon.ico'; }}
-        />
+        {p.image_url ? (
+          <img
+            className="product-card-image"
+            src={p.image_url}
+            alt={p.name}
+            loading="lazy"
+            onError={(e: any) => { e.target.style.visibility = 'hidden' }}
+          />
+        ) : (
+          <div className="product-card-image" aria-hidden="true" />
+        )}
       </div>
       <div className="product-card-body">
         <div className="product-card-header">
@@ -274,7 +278,7 @@ function ProductCard({ p }: { p: any }) {
             </div>
           ) : null}
           <div className="product-card-trend">
-            <span className="product-card-trend-icon {trendClass}">
+            <span className={`product-card-trend-icon ${trendClass}`}>
               {trendClass === 'down' ? '▼' : '▲'}
             </span>
             <span className="product-card-trend-label">{trendLabel}</span>
@@ -344,7 +348,7 @@ function ProductChart({ p }: { p: any }) {
     (s: any) => {
       const d = new Date(s.fecha)
       const now = new Date()
-      return d >= new Date(now - (rangeDays[timeRange] || 9999) * 86400000)
+      return d >= new Date(now.getTime() - (rangeDays[timeRange] || 9999) * 86400000)
     }
   )
 
@@ -469,8 +473,8 @@ function ProductChart({ p }: { p: any }) {
               fill="none"
               stroke="var(--accent-green)"
               strokeWidth={2}
-              strokeLineCap="round"
-              strokeLineJoin="round"
+              strokeLinecap="round"
+              strokeLinejoin="round"
             />
           )}
           {/* Marcadores de precios */}
@@ -481,7 +485,7 @@ function ProductChart({ p }: { p: any }) {
             const y =
               80 -
               ((point.precio || 0) /
-                (maxInRange - minInRange || 4000)) *
+                (chartMax - chartMin || 4000)) *
                 260
             if (y >= 80 && y <= 340) {
               return (
@@ -511,7 +515,7 @@ function ProductChart({ p }: { p: any }) {
                   (s: any) => s.precio === minInRange
                 ) / Math.max(filtered.length - 1, 1)) * 680
               }
-              cy={80 - (minInRange / (maxInRange - minInRange || 4000)) * 260}
+              cy={80 - (minInRange / (chartMax - chartMin || 4000)) * 260}
               r={4}
               fill="var(--accent-red)"
               stroke="var(--bg)"
@@ -526,7 +530,7 @@ function ProductChart({ p }: { p: any }) {
                   (s: any) => s.precio === maxInRange
                 ) / Math.max(filtered.length - 1, 1)) * 680
               }
-              cy={80 - (maxInRange / (maxInRange - minInRange || 4000)) * 260}
+              cy={80 - (maxInRange / (chartMax - chartMin || 4000)) * 260}
               r={4}
               fill="var(--accent-green)"
               stroke="var(--bg)"
@@ -545,7 +549,7 @@ function ProductChart({ p }: { p: any }) {
               cy={
                 80 -
                 (currentObservation.precio /
-                  (maxInRange - minInRange || 4000)) *
+                  (chartMax - chartMin || 4000)) *
                   260
               }
               r={5}
@@ -560,7 +564,7 @@ function ProductChart({ p }: { p: any }) {
             y={360}
             fill="var(--fg)"
             fontSize={0.7}
-            style="pointer-events: none;"
+            style={{ pointerEvents: 'none' }}
           >
             Precio:{" "}
             {currentObservation?.precio?.toLocaleString('es-ES') || '—'} |{" "}
@@ -721,7 +725,7 @@ function ProductDetail({ sku }: { sku: string }) {
   } = product
 
   // Calcular cambio desde primera observación
-  let changeFromFirst = null
+  let changeFromFirst: number | null = null
   if (firstPrice !== null && currentPrice !== null && firstPrice > currentPrice) {
     changeFromFirst = Math.round((firstPrice - currentPrice) / firstPrice * 100)
   } else if (firstPrice !== null && currentPrice !== null && firstPrice < currentPrice) {
@@ -759,7 +763,11 @@ function ProductDetail({ sku }: { sku: string }) {
 
   // Determinar clase de tendencia
   const trendClass =
-    change7d > 0 ? 'price-down' : change7d < 0 ? 'price-up' : ''
+    change7d !== null && change7d > 0
+      ? 'price-down'
+      : change7d !== null && change7d < 0
+        ? 'price-up'
+        : ''
 
   return (
     <main className="app product-detail-app">
@@ -894,6 +902,12 @@ export default function MainApp() {
   // Filtrar solo productos con precios válidos para cálculos
   const validPrices = prices.filter(function (p: any) { return p.currentPrice !== null })
   const totalPCs = validPrices.length
+
+  // Top productos con mayor descuento para el ranking de "Mayores bajadas"
+  const topRankings = validPrices
+    .filter(function (p: any) { return p.discount !== null && p.discount > 0 })
+    .sort(function (a: any, b: any) { return (b.discount || 0) - (a.discount || 0) })
+    .slice(0, 5)
 
   // Calcular el total de páginas
   const ITEMS_PER_PAGE = 48
@@ -1073,7 +1087,7 @@ export default function MainApp() {
             aria-label="Precio máximo rango"
           />
           <select
-            value={onlyDiscount}
+            value={onlyDiscount ? 'true' : 'false'}
             onChange={(e: any) => setOnlyDiscount(e.target.value === 'true')}
           >
             <option value="false">Mostrar todos</option>

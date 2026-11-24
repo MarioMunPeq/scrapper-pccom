@@ -127,7 +127,7 @@ export default function App() {
   // @ts-ignore
   var _a: any[] = usePrices(), prices: any[] = _a[0], showSampleWarning: boolean = _a[1]
   // @ts-ignore
-  var _b: any = useFilters(prices), search: any = _b.search, setSearch: any = _b.setSearch, minPrice: any = _b.minPrice, setMinPrice: any = _b.setMinPrice, maxPrice: any = _b.maxPrice, setMaxPrice: any = _b.setMaxPrice, onlyDiscount: any = _b.onlyDiscount, setOnlyDiscount: any = _b.setOnlyDiscount, cpuFilter: any = _b.cpuFilter, setCpuFilter: any = _b.setCpuFilter, ramFilter: any = _b.ramFilter, setRamFilter: any = _b.setRamFilter, sortBy: any = _b.sortBy, sorted: any[] = _b.sorted
+  var _b: any = useFilters(prices), search: any = _b.search, setSearch: any = _b.setSearch, minPrice: any = _b.minPrice, setMinPrice: any = _b.setMinPrice, maxPrice: any = _b.maxPrice, setMaxPrice: any = _b.setMaxPrice, onlyDiscount: any = _b.onlyDiscount, setOnlyDiscount: any = _b.setOnlyDiscount, cpuFilter: any = _b.cpuFilter, setCpuFilter: any = _b.setCpuFilter, ramFilter: any = _b.ramFilter, setRamFilter: any = _b.setRamFilter, sortBy: any = _b.sortBy, setSortBy: any = _b.setSortBy, sorted: any[] = _b.sorted
 
   return React.createElement('main', { className: 'app' },
     React.createElement('section', { className: 'hero', 'aria-label': 'KPIs globales' },
@@ -198,9 +198,9 @@ export default function App() {
     React.createElement('section', { className: 'ranking', 'aria-label': 'Rankings' },
       React.createElement('h2', null, 'Mayores bajadas'),
       // @ts-ignore
-      React.createElement('p', null, allPrices.filter(function (p: any) { return p.discount && p.discount > 0 }).length + ' productos tienen descuento'),
+      React.createElement('p', null, prices.filter(function (p: any) { return p.discount && p.discount > 0 }).length + ' productos tienen descuento'),
       React.createElement('div', { className: 'ranking-lista' },
-        allPrices.filter(function (p: any) { return p.discount && p.discount > 0 })
+        prices.filter(function (p: any) { return p.discount && p.discount > 0 })
           .sort(function (a: any, b: any) { return (b.discount || 0) - (a.discount || 0) })
           .slice(0, 5).map(function (p: any) {
             return React.createElement('div', { key: p.sku, className: 'ranking-item' },
