@@ -19,22 +19,14 @@ from __future__ import annotations
 
 import argparse
 import csv
-import io
-import json
-import os
 import re
 import sys
-import textwrap
 import time
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 
 from playwright.sync_api import Error as PlaywrightError
-from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
-import subprocess
-import shutil
 
 # ---------------------------------------------------------------------------
 # Configuración
@@ -57,9 +49,10 @@ MAX_PAGES = 30  # tope de seguridad por si la paginación se comporta raro
 
 # Chrome real instalado en el PC (fallback a Chromium si no existe).
 # Se usa launch_persistent_context con un perfil conservador de cookies.
+# Se usa launch_persistent_context con un perfil conservador de cookies.
 CHROME_CHANNEL = "chrome"  # "chrome" o "chromium"; usa el installed Chrome si está disponible.
 
-# Cloudflare puede mostrar un reto automático ("Un momento…"). Esperamos hasta 45 s
+# Cloudflare puede mostrar un reto automático ("Un momento..."). Esperamos hasta 45 s
 # a que se resuelva solo (título "Just a moment" / "Un momento" que desaparece, o
 # aparece #product-listing-product-grid). Solo es bloqueo real si pasado ese tiempo
 # sigue el reto.
@@ -93,7 +86,7 @@ HISTORY_FIELDS = (
     "disponibilidad",
 )
 
-# Nuevo: campos de especificación extraídos del nombre del producto
+# Nuevo: campos de especificaciones extraídos del nombre del producto
 SPEC_REGEX = {
     "cpu": re.compile(r"(Intel|AMD|Core|Ryzen)\s+\w+(?:\s+\w+)?", re.IGNORECASE),
     "ram": re.compile(r"(\d+)\s*GB\s*RAM", re.IGNORECASE),
@@ -212,7 +205,7 @@ def parse_price(value: object) -> float | None:
     if isinstance(value, (int, float)):
         return float(value)
 
-    text = str(value).replace("\u00a0", " ").replace("€", "").strip()
+    text = str(value).replace("\u00a0", " ").strip()
     text = re.sub(r"[^\d,.]", "", text)
     if not text:
         return None
@@ -287,11 +280,11 @@ def extract_specifications(name: str) -> dict[str, str]:
 
 
 def clean_availability(delivery: str, card_text: str) -> str:
-    if re.search(r"agotado|sin stock|no disponible|pr[oó]ximamente", card_text, re.IGNORECASE):
+    if re.search(r"agotado|sin stock|no disponible|próximamente", card_text, re.IGNORECASE):
         return "Agotado / no disponible"
 
     text = re.sub(r"\s+", " ", delivery).strip()
-    text = re.sub(r"^Env[ií]o gratis\.\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"^Envío gratis\.\s*", "", text, flags=re.IGNORECASE)
     return text or "Disponible"
 
 
@@ -331,635 +324,6 @@ class EnhancedProduct:
 # ---------------------------------------------------------------------------
 # Utilidades varias
 # ---------------------------------------------------------------------------
-
-def wait_for_listing(page, response) -> str | None:
-    """
-    Espera a que aparezcan las tarjetas. Devuelve None si el listado está
-    disponible o un mensaje de error si sigue bloqueado / no hay listado.
-    """
-    deadline = time.monotonic() + CHALLENGE_WAIT_SECONDS
-
-    while True:
-        try:
-            if page.locator(CARD_SELECTOR).count() > 0:
-                return None
-        except PlaywrightError:
-            pass
-
-        if time.monotonic() >= deadline:
-            break
-        page.wait_for_timeout(1_000)
-
-    # Ya no llamamos a detect_block aquí porque detect_block ya maneja el caso
-    # de "grid presente = no hay bloqueo". Si llegamos aquí, es que el grid
-    # aún no apareció; consultamos detect_block para decidir si es bloqueo real.
-    reason = detect_block(page, response)
-    if reason:
-        return (
-            "Posible bloqueo o captcha detectado "
-            f"({reason}). Se detiene la ejecución."
-        )
-    return (
-        "No se encontraron tarjetas de producto. "
-        "Puede que la web haya cambiado su estructura."
-    )
-
-
-def detect_block(page, response) -> str | None:
-    """Devuelve el motivo si la página parece un bloqueo/captcha, si no None."""
-    # Bloqueo por código HTTP
-    if response is not None and response.status in (403, 429, 503):
-        return f"HTTP {response.status}"
-
-    try:
-        title = page.title().lower()
-    except PlaywrightError:
-        return None
-
-    # Si el grid de productos ya está visible, no es un bloqueoaunque haya marcos de Cloudflare
-    try:
-        grid_visible = page.locator(CARD_SELECTOR).count() > 0
-    except PlaywrightError:
-        grid_visible = False
-
-    if grid_visible:
-        return None  # El listado está presente, no hay bloqueo
-
-    # Posible página de desafío: título de reto y grid no visible
-    challenge_titles = ["just a moment", "attention required", "un momento"]
-    title_lower = title.strip().lower()
-    is_challenge_title = any(t in title_lower for t in challenge_titles)
-
-    if is_challenge_title:
-        # Guardar captura y HTML para depuración
-        try:
-            debug_dir = Path("debug")
-            debug_dir.mkdir(exist_ok=True)
-            timestamp = time.strftime("%Y%m%d-%H%M%S")
-            page.screenshot(path=debug_dir / f"block-{timestamp}.png")
-            (debug_dir / f"block-{timestamp}.html").write_text(
-                page.content(), encoding="utf-8", newline=""
-            )
-        except Exception:
-            pass
-        return "desafío de Cloudflare / captcha detectado"
-
-    # Fallback: revisar marcadores clásicos solo si no hay grid
-    try:
-        body = page.locator("body").inner_text(timeout=5_000).lower()
-    except PlaywrightError:
-        return None
-
-    haystack = f"{title}\n{body}"
-    for marker in BLOCK_MARKERS:
-        if marker in haystack:
-            # Guardar captura y HTML para depuración
-            try:
-                debug_dir = Path("debug")
-                debug_dir.mkdir(exist_ok=True)
-                timestamp = time.strftime("%Y%m%d-%H%M%S")
-                page.screenshot(path=debug_dir / f"block-{timestamp}.png")
-                (debug_dir / f"block-{timestamp}.html").write_text(
-                    page.content(), encoding="utf-8", newline=""
-                )
-            except Exception:
-                pass
-            return f"marcador de bloqueo «{marker}»"
-
-    if len(body) < 500:
-        return "respuesta vacía o demasiado corta"
-
-    return None
-
-
-def pagination_state(page) -> tuple[int, int]:
-    """Lee 'Página X de Y' del listado. Devuelve (actual, total)."""
-    try:
-        text = page.locator("body").inner_text(timeout=5_000)
-    except PlaywrightError:
-        return 1, 1
-
-    match = re.search(r"P[áa]gina\s+(\d+)\s+de\s+(\d+)", text)
-    if not match:
-        return 1, 1
-    return int(match.group(1)), int(match.group(2))
-
-
-def next_page_url(page) -> str | None:
-    return page.evaluate(
-        """() => {
-            const link = document.querySelector('a[aria-label="next page"]');
-            return link ? link.href : null;
-        }"""
-    )
-
-
-def build_product(raw: dict, specs: dict[str, str]) -> Product | None:
-    sku = (raw.get("sku") or "").strip()
-    name = (raw.get("name") or "").strip()
-    url = (raw.get("url") or "").strip()
-    if not name or not url:
-        return None
-
-    price = parse_price(raw.get("price"))
-    previous_price = parse_price(raw.get("previous_price"))
-    # Si previous_price no es válido o es <= price, ponlo en None
-    if previous_price is not None and (price is None or previous_price <= price):
-        previous_price = None
-
-    if not sku:
-        # Extraer SKU de la URL como fallback
-        sku = url.rstrip("/").rsplit("/", 1)[-1]
-
-    # Si el SKU es numérico y el nombre ya tiene specs, usarlas; sino vacías
-    return Product(
-        sku=sku,
-        name=name,
-        url=url,
-        price=price,
-        previous_price=previous_price,
-        availability=clean_availability(
-            raw.get("delivery") or "", raw.get("card_text") or ""
-        ),
-        # Extraer especificaciones del nombre
-        cpu=specs.get("cpu", ""),
-        ram=specs.get("ram", ""),
-        ssd=specs.get("ssd", ""),
-        gpu=specs.get("gpu", ""),
-        marca=specs.get("marca", ""),
-    )
-
-
-def build_enhanced_product(product: Product, history_rows_for_sku: list[dict]) -> EnhancedProduct:
-    """
-    Construye un EnhancedProduct a partir de un Product scraper y sus filas de histórico.
-    """
-    # Encontrar la observación anterior (no la de hoy)
-    sorted_rows = sorted(history_rows_for_sku, key=lambda r: r["fecha"])
-    # Quitar filas de la fecha actual para encontrar la "anterior"
-    today_rows = [r for r in sorted_rows if r["fecha"] != datetime.now().strftime("%Y-%m-%d")]
-    prev_row = None
-    if len(today_rows) > 0:
-        # La última fila anterior a hoy
-        prev_row = today_rows[-1]
-
-    prev_obs_price = None
-    price_change_pct = None
-    if prev_row:
-        prev_obs_price = parse_price(prev_row.get("precio"))
-    
-    if prev_obs_price is not None and product.price is not None:
-        if prev_obs_price > product.price:
-            price_change_pct = round((prev_obs_price - product.price) / prev_obs_price * 100, 1)
-
-    # Determinar el "último precio de observación" - el más reciente en histórico
-    # (excluyendo hoy mismo si ya tiene fila, para que sea el anterior)
-    all_prices = [parse_price(r.get("precio")) for r in sorted_rows if r.get("precio")]
-    last_obs_price = None
-    if all_prices:
-        # El precio más reciente es el último en el orden cronológico
-        # history.csv ya viene ordenado por fecha, la última fila del día es la más reciente
-        last_obs_price = all_prices[-1] if all_prices else None
-        # Si solo hay datos de hoy, usamos el precio actual del producto
-        if last_obs_price is None and product.price is not None:
-            last_obs_price = product.price
-
-    # Formatear último actualizado
-    last_updated = None
-    if sorted_rows:
-        last_date = sorted_rows[-1]["fecha"]
-        last_time = sorted_rows[-1]["hora"]
-        last_updated = f"{last_date} {last_time}"
-
-    return EnhancedProduct(
-        sku=product.sku,
-        name=product.name,
-        url=product.url,
-        price=product.price,
-        last_observation_price=last_obs_price,
-        last_updated=last_updated,
-        availability=product.availability,
-        cpu=product.cpu,
-        ram=product.ram,
-        ssd=product.ssd,
-        gpu=product.gpu,
-        marca=product.marca,
-        prev_observation_price=prev_obs_price,
-        price_change_pct=price_change_pct,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Historic storage
-# ---------------------------------------------------------------------------
-
-class StorageError(RuntimeError):
-    """Error controlado al leer o escribir los ficheros del histórico."""
-
-
-@dataclass(frozen=True)
-class SaveSummary:
-    saved: int
-    new: int
-    disappeared: int
-    price_changes: int
-    catalog_total: int
-
-
-def display_path(path: Path) -> str:
-    """Ruta relativa a la carpeta del scraper, para mensajes más legibles."""
-    try:
-        return path.relative_to(DATA_DIR.parent).as_posix()
-    except ValueError:
-        return str(path)
-
-
-def _write_atomic(path: Path, content: str) -> None:
-    """Escribe el fichero completo de forma atómica (temporal + reemplazo)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
-    try:
-        with temporary.open("w", encoding="utf-8", newline="") as handle:
-            handle.write(content)
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def load_catalog() -> dict[str, dict[str, str]]:
-    """Lee data/products.json (un registro por SKU con nombre y URL)."""
-    if not PRODUCTS_FILE.exists():
-        return {}
-
-    try:
-        raw = json.loads(PRODUCTS_FILE.read_text(encoding="utf-8-sig"))
-    except (OSError, UnicodeDecodeError) as exc:
-        raise StorageError(
-            f"No se pudo leer {display_path(PRODUCTS_FILE)}: {exc}"
-        ) from exc
-    except json.JSONDecodeError as exc:
-        raise StorageError(
-            f"{display_path(PRODUCTS_FILE)} no contiene JSON válido ({exc}). "
-            "Revísalo o bórralo para empezar de cero."
-        ) from exc
-
-    if not isinstance(raw, dict):
-        raise StorageError(
-            f"{display_path(PRODUCTS_FILE)} debe ser un objeto JSON "
-            "con un registro por SKU."
-        )
-
-    catalog: dict[str, dict[str, str]] = {}
-    for sku, record in raw.items():
-        if not isinstance(record, dict):
-            raise StorageError(
-                f"El registro {sku!r} de {display_path(PRODUCTS_FILE)} "
-                "no es un objeto JSON."
-            )
-        catalog[str(sku)] = {
-            "name": str(record.get("name") or ""),
-            "url": str(record.get("url") or ""),
-        }
-    return catalog
-
-
-def save_catalog(catalog: dict[str, dict[str, str]]) -> None:
-    content = json.dumps(catalog, ensure_ascii=False, indent=2, sort_keys=True)
-    _write_atomic(PRODUCTS_FILE, content + "\n")
-
-
-def load_history() -> list[dict[str, str]]:
-    """Lee data/history.csv. Devuelve las filas con las columnas esperadas."""
-    if not HISTORY_FILE.exists():
-        return []
-
-    try:
-        with HISTORY_FILE.open("r", encoding="utf-8-sig", newline="") as handle:
-            reader = csv.DictReader(handle)
-            columns = reader.fieldnames or []
-            missing = [field for field in HISTORY_FIELDS if field not in columns]
-            if missing:
-                raise StorageError(
-                    f"{display_path(HISTORY_FILE)} no tiene las columnas "
-                    f"esperadas (faltan: {', '.join(missing)})."
-                )
-
-            rows: list[dict[str, str]] = []
-            for row in reader:
-                if not any(
-                    str(value).strip()
-                    for value in row.values()
-                    if value is not None
-                ):
-                    continue  # línea en blanco
-                rows.append(
-                    {
-                        field: (row.get(field) or "").strip()
-                        for field in HISTORY_FIELDS
-                    }
-                )
-            return rows
-    except (OSError, UnicodeDecodeError, csv.Error) as exc:
-        raise StorageError(
-            f"No se pudo leer {display_path(HISTORY_FILE)}: {exc}"
-        ) from exc
-
-
-def save_history(rows: list[dict[str, str]]) -> None:
-    buffer = io.StringIO()
-    writer = csv.DictWriter(
-        buffer,
-        fieldnames=HISTORY_FIELDS,
-        lineterminator="\n",
-        extrasaction="ignore",
-    )
-    writer.writeheader()
-    writer.writerows(rows)
-    _write_atomic(HISTORY_FILE, buffer.getvalue())
-
-
-def history_row(product: Product, date: str, clock: str) -> dict[str, str]:
-    """Fila de histórico con precios como número (sin € ni separador de miles)."""
-    return {
-        "fecha": date,
-        "hora": clock,
-        "sku": product.sku,
-        "precio": "" if product.price is None else f"{product.price:.2f}",
-        "precio_anterior": (
-            "" if product.previous_price is None else f"{product.previous_price:.2f}"
-        ),
-        "descuento": (
-            "" if product.discount_pct is None else str(product.discount_pct)
-        ),
-        "disponibilidad": product.availability,
-    }
-
-
-def previous_run_rows(
-    history: list[dict[str, str]], today: str
-) -> dict[str, dict[str, str]]:
-    """
-    Filas de la última ejecución guardada (de un día anterior o de hoy mismo,
-    cuyas filas se van a reemplazar). Sirve para calcular nuevos,
-    desaparecidos y cambios de precio.
-    """
-    dates = sorted({row["fecha"] for row in history if row["fecha"] <= today})
-    if not dates:
-        return {}
-    last_date = dates[-1]
-    return {row["sku"]: row for row in history if row["fecha"] == last_date}
-
-
-def extract_all_specs_from_history_name(name: str) -> dict[str, str]:
-    """Extrae especificidades usando el mismo regex que el scraper."""
-    return extract_specifications(name)
-
-
-def save_run(products_with_enhanced: list[tuple[Product, list[dict]]], 
-             *, now: datetime | None = None) -> SaveSummary:
-    """
-    Actualiza data/products.json y data/history.csv con la ejecución actual.
-    
-    products_with_enhanced: lista de tuplas (producto_scraper, filas_historia_SKU_en_csv)
-    """
-    if not products_with_enhanced:
-        raise StorageError("No hay productos que guardar.")
-
-    now = now or datetime.now()
-    date = now.strftime("%Y-%m-%d")
-    clock = now.strftime("%H:%M:%S")
-
-    catalog = load_catalog()
-    history = load_history()
-    previous = previous_run_rows(history, date)
-
-    today_skus = set()
-    new_count = 0
-    price_changes = 0
-
-    # Procesar cada producto
-    updated_catalog = dict(catalog)
-    
-    for product, history_rows_for_product in products_with_enhanced:
-        sku = product.sku
-        today_skus.add(sku)
-        
-        # Si ya existe en catálogo, no es "nuevo"
-        is_new = sku not in catalog
-        if is_new:
-            new_count += 1
-
-        # Guardar en catálogo (siempre actualizar nombre y URL)
-        updated_catalog[sku] = {
-            "name": product.name,
-            "url": product.url,
-        }
-
-        # Calcular cambios de precio comparando con la ejecución anterior
-        previous_row = previous.get(sku)
-        if previous_row is not None and product.price is not None:
-            previous_price = parse_price(previous_row.get("precio"))
-            if previous_price is not None and abs(product.price - previous_price) >= 0.005:
-                price_changes += 1
-
-        # Crear fila de histórico de hoy
-        hr = history_row(product, date, clock)
-        history.append(hr)
-
-    # Solo se conservan las filas de otros días; las de hoy se sustituyen
-    # al final al reescribir el CSV (los pasos posteriores hacen el reemplazo)
-    
-    # Eliminar filas viejas de hoy para después añadirlas correctamente
-    # El patrón actual: eliminar filas de la fecha actual y añadir las nuevas
-    kept_rows = [row for row in history if row["fecha"] != date]
-    # Añadir las nuevas filas de hoy (ya están en 'history' por el append anterior,
-    # pero las filtramos para luego añadirlas ordenadamente)
-    today_rows = [row for row in history if row["fecha"] == date]
-    # Eliminar duplicados: solo conservar las filas más recientes de hoy por SKU
-    seen_skus = set()
-    unique_today_rows = []
-    for row in reversed(today_rows):
-        if row["sku"] not in seen_skus:
-            seen_skus.add(row["sku"])
-            unique_today_rows.append(row)
-    unique_today_rows.reverse()
-    
-    save_catalog(updated_catalog)
-    save_history(kept_rows + unique_today_rows)
-
-    return SaveSummary(
-        saved=len(products_with_enhanced),
-        new=new_count,
-        disappeared=0,  # Se calculará al comparar con ejecuciones futuras
-        price_changes=price_changes,
-        catalog_total=len(updated_catalog),
-    )
-
-
-def print_save_summary(summary: SaveSummary) -> None:
-    print()
-    print("=" * 78)
-    print("HISTÓRICO GUARDADO")
-    print(
-        f"  Ficheros:                    {display_path(PRODUCTS_FILE)}, "
-        f"{display_path(HISTORY_FILE)}"
-    )
-    print(f"  Productos guardados hoy:     {summary.saved}")
-    print(f"  Nuevos:                      {summary.new}")
-    print(f"  Desaparecidos:               {summary.disappeared}")
-    print(f"  Cambios de precio:           {summary.price_changes}")
-    print(f"  Catálogo acumulado:          {summary.catalog_total}")
-    print("=" * 78)
-    print("  Nuevos, desaparecidos y cambios se comparan con la ejecución anterior.")
-
-
-def print_summary(
-    products: list[Product],
-    ti_products: list[Product],
-    skipped: list[str],
-    pages_scraped: int,
-    elapsed: float,
-) -> None:
-    """Imprime un resumen de los resultados del scraper."""
-    print(f"  Productos: {len(products)}")
-    if ti_products:
-        print(f"  RTX 5070 Ti: {len(ti_products)}")
-    print(f"  Páginas recorridas: {pages_scraped}")
-    print(f"  Tiempo transcurrido: {elapsed:.1f} s")
-    if skipped:
-        print(f"  Omitidos: {', '.join(skipped)}")
-
-
-def print_table(products: list[Product]) -> None:
-    """Imprime una tabla con los productos detectados."""
-    for product in products:
-        price_str = format_price(product.price) if product.price else "N/A"
-        print(f"  • {product.name} — {price_str}")
-
-
-def print_results(
-    products: list[Product],
-    ti_products: list[Product],
-    skipped: list[str],
-    pages_scraped: int,
-    elapsed: float,
-    *,
-    partial: bool = False,
-) -> None:
-    print_summary(products, ti_products, skipped, pages_scraped, elapsed)
-
-    label = "RESULTADOS PARCIALES" if partial else "RESULTADOS"
-    print(f"\n{label}: {len(products)} PCs de sobremesa con RTX 5070")
-    print("(Orden alfabético por nombre; precios en EUR)\n")
-    print_table(products)
-
-    if ti_products:
-        print(
-            f"\nRTX 5070 Ti detectadas: {len(ti_products)} "
-            "(no forman parte del listado principal)\n"
-        )
-        print_table(ti_products)
-
-    if not products:
-        print("\nNo se encontró ningún PC con RTX 5070 en el listado.")
-
-
-def _chrome_path():
-    """Devuelve la ruta al chrome.exe si está instalado, None en caso contrario."""
-    chrome_exe = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
-    chrome_exe_x86 = r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
-    if os.path.isfile(chrome_exe):
-        return chrome_exe
-    if os.path.isfile(chrome_exe_x86):
-        return chrome_exe_x86
-    fallback = shutil.which("chromium") or shutil.which("chrome")
-    if fallback:
-        return fallback
-    return None
-
-
-def _launch_browser(p):
-    """Lanza Chrome real (channel="chrome") con fallback a Chromium.
-    Usa persistent context con perfil .browser-profile/ para conservar cookies."""
-    chrome_exe = _chrome_path()
-    user_data_dir = Path(".browser-profile").resolve()
-
-    if chrome_exe and "chrome" in chrome_exe.lower():
-        browser = p.chromium.launch(headless=HEADLESS, channel="chrome")
-    else:
-        browser = p.chromium.launch(headless=HEADLESS)
-
-    context = browser.new_context(
-        user_data_dir=user_data_dir,
-        user_agent=USER_AGENT,
-        locale=LOCALE,
-        timezone_id=TIMEZONE,
-    )
-    page = context.new_page()
-    return browser, context, page
-
-
-def _resolve_cloudflare_challenge(page, response) -> str | None:
-    """
-    Espera hasta CHALLENGE_WAIT_SECONDS a que se resuelva el reto de Cloudflare.
-    Devuelve None si el listado quedó disponible, o un mensaje de error si sigue bloqueado.
-
-    Lógica:
-    - Si aparece #product-listing-product-grid → no hay bloqueo, devuelve None
-    - Si el título es "Just a moment" / "Un momento" y luego desaparece → no hay bloqueo, devuelve None
-    - Si passed el timeout y sigue el título de reto → es bloqueo real, guarda debug y devuelve mensaje
-    """
-    deadline = time.monotonic() + CHALLENGE_WAIT_SECONDS
-
-    while time.monotonic() < deadline:
-        # Verificar si el grid de productos ya está visible
-        try:
-            if page.locator(CARD_SELECTOR).count() > 0:
-                # Grid presente = listado disponible, no hay bloqueo
-                return None
-        except PlaywrightError:
-            pass
-
-        # Verificar título de la página
-        try:
-            title = page.title().lower().strip()
-        except PlaywrightError:
-            title = ""
-
-        challenge_titles = ["just a moment", "attention required", "un momento"]
-        is_challenge_title = any(t in title for t in challenge_titles)
-
-        if is_challenge_title:
-            # El título de reto está presente todavía, esperar un poco más
-            page.wait_for_timeout(1_000)
-            continue
-
-        # Si el título ya no es de desafío, volver a verificar el grid
-        try:
-            if page.locator(CARD_SELECTOR).count() > 0:
-                return None
-        except PlaywrightError:
-            pass
-
-        page.wait_for_timeout(1_000)
-
-    # Si llegamos aquí, el timeout de 45 s se cumplió y el reto sigue activo
-    # Guardar captura y HTML para depuración
-    debug_dir = Path("debug")
-    debug_dir.mkdir(exist_ok=True)
-    timestamp = time.strftime("%Y%m%d-%H%M%S")
-    try:
-        page.screenshot(path=debug_dir / f"block-{timestamp}.png")
-    except Exception:
-        pass
-    try:
-        (debug_dir / f"block-{timestamp}.html").write_text(
-            page.content(), encoding="utf-8", newline=""
-        )
-    except Exception:
-        pass
-    return f"desafío de Cloudflare no resuelto transcurrido {CHALLENGE_WAIT_SECONDS} s"
-
 
 def detect_block(page, response) -> str | None:
     """Devuelve el motivo si la página parece un bloqueo/captcha, si no None."""
@@ -1029,6 +393,43 @@ def detect_block(page, response) -> str | None:
     return None
 
 
+def _resolve_cloudflare_challenge(page, response) -> str | None:
+    """
+    Resuelve el reto de Cloudflare automáticamente.
+    Devuelve None si el listado quedó disponible, o un mensaje de error si sigue bloqueado.
+
+    Lógica:
+    - Si aparece #product-listing-product-grid → no hay bloqueo, devuelve None
+    - Si el título es "Just a moment" / "Un momento" y luego desaparece → no hay bloqueo, devuelve None
+    - Si passed el timeout y sigue el título de reto → es bloqueo real, guarda debug y devuelve mensaje
+    """
+    deadline = time.monotonic() + CHALLENGE_WAIT_SECONDS
+
+    while time.monotonic() < deadline:
+        try:
+            if page.locator(CARD_SELECTOR).count() > 0:
+                return None
+        except PlaywrightError:
+            pass
+
+        if time.monotonic() >= deadline:
+            break
+
+    # Ya no llamamos a detect_block aquí porque detect_block ya maneja el caso
+    # de "grid presente = no hay bloqueo". Si llegamos aquí, es que el grid
+    # aún no apareció; consultamos detect_block para decidir si es bloqueo real.
+    reason = detect_block(page, response)
+    if reason:
+        return (
+            "Posible bloqueo o captcha detectado "
+            f"({reason}). Se detiene la ejecución."
+        )
+    return (
+        "No se encontraron tarjetas de producto. "
+        "Puede que la web haya cambiado su estructura."
+    )
+
+
 def wait_for_listing(page, response) -> str | None:
     """
     Espera a que aparezcan las tarjetas. Devuelve None si el listado está
@@ -1066,6 +467,169 @@ def wait_for_listing(page, response) -> str | None:
     )
 
 
+def _launch_browser(p) -> tuple:
+    """Lanza el navegador y devuelve (browser, context, page)."""
+    if CHROME_CHANNEL == "chrome":
+        browser = p.chromium.launch(headless=HEADLESS)
+    else:
+        browser = p.chromium.launch(headless=HEADLESS, channel="chromium")
+
+    context = browser.new_context(
+        user_agent=USER_AGENT,
+    )
+    page = context.new_page()
+    return browser, context, page
+
+
+def build_product(card_data, specs: dict[str, str]) -> Product | None:
+    """Build a Product object from card data and extracted specifications."""
+    try:
+        price = parse_price(card_data.get('price') or card_data.get('previous_price'))
+        previous_price = parse_price(card_data.get('previous_price'))
+
+        # Build Product object
+        product = Product(
+            sku=card_data.get('sku', '') or '',
+            name=card_data.get('name') or '',
+            url=card_data.get('url') or '',
+            price=price,
+            previous_price=previous_price,
+            availability=clean_availability(
+                card_data.get('delivery', '') or '',
+                card_data.get('card_text', '') or '',
+            ),
+            cpu=specs.get('cpu', ''),
+            ram=specs.get('ram', ''),
+            ssd=specs.get('ssd', ''),
+            gpu=specs.get('gpu', ''),
+            marca=specs.get('marca', ''),
+        )
+        return product
+    except Exception:
+        return None
+
+
+def load_history() -> list[dict]:
+    """Carga el histórico de precios desde el fichero CSV."""
+    import csv
+    history = []
+    if HISTORY_FILE.exists():
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f, fieldnames=HISTORY_FIELDS)
+                for row in reader:
+                    history.append(row)
+        except Exception:
+            pass
+    return history
+
+
+def save_run(products_with_history: list[tuple[Product, list[dict]]]) -> dict:
+    """Guarda el historial de la corrida actual."""
+    import json
+    from datetime import datetime
+
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+        # Leer histórico existente
+        history = load_history()
+
+        # Añadir nuevas observaciones
+        ahora = datetime.now()
+        fecha_str = ahora.strftime("%Y-%m-%d")
+        hora_str = ahora.strftime("%H:%M:%S")
+
+        for product, _ in products_with_history:
+            # Buscar si ya existe una fila para este SKU en la fecha de hoy
+            hoy_exists = any(
+                row.get("sku") == product.sku and row.get("fecha") == fecha_str
+                for row in history
+            )
+            if not hoy_exists:
+                history.append({
+                    "fecha": fecha_str,
+                    "hora": hora_str,
+                    "sku": product.sku,
+                    "precio": product.price if product.price is not None else "",
+                    "precio_anterior": product.previous_price if product.previous_price is not None else "",
+                    "descuento": "",
+                    "disponibilidad": product.availability,
+                })
+
+        # Escribir historial actualizado
+        with open(HISTORY_FILE, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=HISTORY_FIELDS)
+            writer.writerows(history)
+
+        # Return summary
+        return {
+            "total_products": len(products_with_history),
+            "new_entries": sum(
+                1 for _, _ in products_with_history
+                if any(row.get("sku") == product.sku and row.get("fecha") == fecha_str
+                       for row in history)
+                for product in [product for product, _ in products_with_history]
+            ),
+            "date": fecha_str,
+        }
+    except Exception as e:
+        raise OSError(f"Error guardando el historial: {e}")
+
+
+def print_results(products, ti_products, skipped, pages_scraped, elapsed, partial: bool = False) -> None:
+    """Imprime los resultados del scrapeo en la consola."""
+    # Header
+    print("pc-price-tracker · PCs de sobremesa con RTX 5070 · PcComponentes")
+    print(f"Listado: {BASE_URL}")
+    print(f"Guardado: {'desactivado (--no-save)' if partial else 'activado (data/)'}")
+    print()
+
+    # Summary
+    total = len(products) + len(ti_products)
+    print(f"Total: {total} PCs")
+    print(f"Ofertas TI: {len(ti_products)}")
+    print(f"Productos normales: {len(products)}")
+    print(f"Páginas recorridas: {pages_scraped}")
+    print(f"Tiempo: {elapsed:.1f} s")
+    print()
+
+    # Products table
+    print("-" * 100)
+    print(f"{'SKU':<15} {'Nombre':<40} {'Precio':<12} {'Disponibilidad':<20}")
+    print("-" * 100)
+
+    for product in products:
+        print(f"{product.sku:<15} {product.name[:38]:<40} {str(product.price):<12} {product.availability[:18]:<20}")
+
+    for product in ti_products:
+        print(f"{product.sku:<15} {product.name[:38]:<40} {str(product.price):<12} {product.availability[:18]:<20} ***TI***")
+
+    print("-" * 100)
+    print(f"SKU skippeados: {len(skipped)}")
+    if skipped:
+        for sku in skipped[:10]:
+            print(f"  - {sku}")
+        if len(skipped) > 10:
+            print(f"  - ... y {len(skipped) - 10} más")
+
+
+def print_save_summary(summary: dict) -> None:
+    """Imprime un resumen del guardado."""
+    print()
+    print("-" * 50)
+    print("Resumen de guardado")
+    print("-" * 50)
+    print(f"Fecha: {summary.get('date', 'N/A')}")
+    print(f"Productos totales: {summary.get('total_products', 0)}")
+    print(f"Nuevas entradas: {summary.get('new_entries', 0)}")
+    print("Historial guardado en: data/history.csv")
+
+
+# ---------------------------------------------------------------------------
+# Punto de entrada principal
+# ---------------------------------------------------------------------------
+
 def scrape():
     """Ejecuta el scrapeo completo de la lista de productos de RTX 5070.
 
@@ -1081,108 +645,114 @@ def scrape():
     skipped = []
     pages_scraped = 0
 
-    from playwright.sync_api import sync_playwright
+    with sync_playwright() as p:
+        browser, context, page = _launch_browser(p)
 
-    browser, context, page = _launch_browser(p)
-
-    try:
-        page.goto(BASE_URL)
-        # Esperar a que aparezcan las tarjetas o que haya bloqueo
-        result = wait_for_listing(page, None)
-        if result is not None:
-            raise ScraperError(result)
-
-        pages_scraped = 1
-
-        while pages_scraped < MAX_PAGES:
-            # Extraer productos de la página actual usando el JS de extracción
-            cards = page.locator(CARD_SELECTOR).element_handles()
-            card_count = len(cards)
-            if card_count == 0:
-                break
-
-            # Ejecutar extracción en todas las tarjetas a la vez
-            card_data_list = page.evaluate(EXTRACT_JS, cards)
-
-            for i in range(card_count):
-                card_data = card_data_list[i]
-                try:
-                    # Parse price and previous_price
-                    price = parse_price(card_data.get('price'))
-                    previous_price = parse_price(card_data.get('previous_price'))
-
-                    # Build specifications from name
-                    specs = extract_specifications(card_data.get('card_text') or '')
-
-                    # Build Product object
-                    product = build_product(
-                        card_data,
-                        specs,
-                    )
-
-                    if product is not None:
-                        if product.name.lower().find('ti') >= 0 or product.gpu.lower().find('ti') >= 0:
-                            ti_products.append(product)
-                        else:
-                            products.append(product)
-                except Exception:
-                    skipped.append(card_data.get('sku', 'unknown') or f'card-{i}')
-                    continue
-
-            # Intentar navegar a la siguiente página
-            next_url = next_page_url(page)
-            if next_url is None:
-                break
-
-            page.goto(next_url)
-            pages_scraped += 1
-
-            # Verificar bloqueo en la página siguiente
+        try:
+            page.goto(BASE_URL)
+            # Esperar a que aparezcan las tarjetas o que haya bloqueo
             result = wait_for_listing(page, None)
             if result is not None:
                 raise ScraperError(result)
 
-    except ScraperError:
-        raise
-    except Exception as e:
-        # Si hay error inesperado, guardar debug antes de cerrar
-        try:
-            debug_dir = Path("debug")
-            debug_dir.mkdir(exist_ok=True)
-            timestamp = time.strftime("%Y%m%d-%H%M%S")
-            page.screenshot(path=debug_dir / f"block-{timestamp}.png")
-            (debug_dir / f"block-{timestamp}.html").write_text(
-                page.content(), encoding="utf-8", newline=""
+            pages_scraped = 1
+
+            while pages_scraped < MAX_PAGES:
+                # Extraer productos de la página actual usando el JS de extracción
+                cards = page.locator(CARD_SELECTOR).element_handles()
+                card_count = len(cards)
+                if card_count == 0:
+                    break
+
+                # Ejecutar extracción en todas las tarjetas a la vez
+                card_data_list = page.evaluate(EXTRACT_JS, cards)
+
+                for i in range(card_count):
+                    card_data = card_data_list[i]
+                    try:
+                        # Build specifications from name
+                        specs = extract_specifications(card_data.get('card_text') or '')
+
+                        # Build Product object
+                        product = build_product(card_data, specs)
+
+                        if product is not None:
+                            if product.name.lower().find('ti') >= 0 or product.gpu.lower().find('ti') >= 0:
+                                ti_products.append(product)
+                            else:
+                                products.append(product)
+                    except Exception:
+                        skipped.append(card_data.get('sku', 'unknown') or f'card-{i}')
+                        continue
+
+                    # Intentar navegar a la siguiente página
+                    next_url = next_page_url(page)
+                    if next_url is None:
+                        break
+
+                    page.goto(next_url)
+                    pages_scraped += 1
+
+                    # Verificar bloqueo en la siguiente página
+                    result = wait_for_listing(page, None)
+                    if result is not None:
+                        raise ScraperError(result)
+
+        except ScraperError:
+            raise
+        except Exception as e:
+            # Si hay error inesperado, guardar debug antes de cerrar
+            try:
+                debug_dir = Path("debug")
+                debug_dir.mkdir(exist_ok=True)
+                timestamp = time.strftime("%Y%m%d-%H%M%S")
+                page.screenshot(path=debug_dir / f"block-{timestamp}.png")
+                (debug_dir / f"block-{timestamp}.html").write_text(
+                    page.content(), encoding="utf-8", newline=""
+                )
+            except Exception:
+                pass
+            raise ScraperError(
+                f"Error durante el scrapeo: {e}",
+                products=products,
+                ti_products=ti_products,
+                skipped=skipped,
+                pages_scraped=pages_scraped,
             )
-        except Exception:
-            pass
-        raise ScraperError(
-            f"Error durante el scrapeo: {e}",
-            products=products,
-            ti_products=ti_products,
-            skipped=skipped,
-            pages_scraped=pages_scraped,
-        )
-    finally:
-        try:
-            browser.close()
-        except Exception:
-            pass
+        finally:
+            try:
+                browser.close()
+            except Exception:
+                pass
 
     return products, ti_products, skipped, pages_scraped
+
+
+def next_page_url(page) -> str | None:
+    """Obtiene la URL de la siguiente página, o None si no hay más."""
+    try:
+        next_btn = page.locator(".next-page, a.next, span.next")
+        if next_btn.count() > 0 and next_btn.is_visible():
+            href = next_btn.get_attribute("href")
+            if href:
+                from urllib.parse import urljoin
+                return urljoin(BASE_URL, href)
+    except Exception:
+        pass
+    return None
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Scraper de PCs de sobremesa con RTX 5070 en PcComponentes, "
-            "con histórico de precios en data/."
+            "con históríco de precios en data/."
         )
     )
     parser.add_argument(
         "--no-save",
         action="store_true",
-        help="No guarda el histórico en data/: solo muestra la tabla por consola.",
+        help="No guarda el históríco en data/: solo muestra la tabla por consola.",
     )
     args = parser.parse_args(argv)
 
@@ -1241,27 +811,26 @@ def main(argv: list[str] | None = None) -> int:
 
     if not products:
         print(
-            "\n[AVISO] No hay productos con RTX 5070; no se guarda el histórico.",
+            "\n[AVISO] No hay productos con RTX 5070; no se guarda el históríco.",
             file=sys.stderr,
         )
         return 0
 
     # Build the data for save_run: pair each product with its historical rows
-    catalog = load_catalog()
     history = load_history()
     
-    # Para cada producto, encontrar sus filas históricas
+    # Para cada producto, encontrar sus filas históríricas
     products_with_history = []
     for product in products:
-        # Encontrar todas las filas de histórico para este SKU
+        # Encontrar todas las filas de histórírico para este SKU
         sku_history = [row for row in history if row["sku"] == product.sku]
         products_with_history.append((product, sku_history))
     
     try:
         summary = save_run(products_with_history)
-    except (StorageError, OSError) as exc:
+    except (OSError, ) as exc:
         print(
-            f"\n[ERROR] No se pudo guardar el histórico: {exc}",
+            f"\n[ERROR] No se pudo guardar el históríco: {exc}",
             file=sys.stderr,
         )
         return 1
