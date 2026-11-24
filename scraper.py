@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import csv
 import re
+import random
 import sys
 import time
 from dataclasses import dataclass
@@ -46,6 +47,13 @@ HEADLESS = True
 MIN_DELAY_SECONDS = 2.0
 MAX_DELAY_SECONDS = 5.0
 MAX_PAGES = 30  # tope de seguridad por si la paginación se comporta raro
+
+# --- Nuevas configuraciones ---
+SETUP_MODE = False  # se pone a True cuando se pasa --setup
+PROFILE_DIR = ".browser-profile"  # perfil persistente de Chrome
+HOMEPAGE_DELAY = (3, 6)  # segundos aleatorios en la página de inicio
+PAGE_DELAY = (4, 9)  # segundos aleatorios entre páginas
+CHALLENGE_TIMEOUT = 30  # s máximo esperando listado tras detectar reto
 
 # Chrome real instalado en el PC (fallback a Chromium si no existe).
 # Se usa launch_persistent_context con un perfil conservador de cookies.
@@ -393,6 +401,65 @@ def detect_block(page, response) -> str | None:
     return None
 
 
+def _detect_turnstile_challenge(page) -> str | None:
+    """
+    Detecta el reto de Turnstile de Cloudflare.
+    Devuelve None si no hay desafío, o un mensaje si se detecta.
+    Los desafíos detectados:
+      - Texto "Verificación de seguridad en curso"
+      - Iframe de Turnstile
+    Si se detecta un desafío, espera hasta CHALLENGE_TIMEOUT s a que aparezca el listado.
+    Si el listado aparece, devuelve None. Si no, guarda debug y devuelve mensaje.
+    """
+
+    # Marcadores de búsqueda del desafío
+    challenge_text_markers = ["verificación de seguridad en curso", "turnstile"]
+    challenge_iframes = page.locator("iframe[title*='turnstile'], iframe[src*='turnstile']")
+
+    # Verificar si aparece el texto de desafío en el body o título
+    try:
+        body_text = page.locator("body").inner_text(timeout=3_000).lower()
+        title = page.title().lower()
+    except Exception:
+        body_text = ""
+        title = ""
+
+    hay_desafío_texto = any(marker in body_text or marker in title for marker in challenge_text_markers)
+    hay_iframe_turnstile = challenge_iframes.count() > 0
+
+    if not hay_desafío_texto and not hay_iframe_turnstile:
+        return None  # No hay desafío
+
+    # Desafío detectado: esperar hasta CHALLENGE_TIMEOUT s a que aparezca el listado
+    print(f"[{time.strftime('%H:%M:%S')}] 🛡️ Desafío de Turnstile detectado, esperando lista hasta {CHALLENGE_TIMEOUT} s...")
+    deadline = time.monotonic() + CHALLENGE_TIMEOUT
+
+    while time.monotonic() < deadline:
+        try:
+            if page.locator(CARD_SELECTOR).count() > 0:
+                print(f"[{time.strftime('%H:%M:%S')}] ✅ Listado apareció después del desafío")
+                return None
+        except Exception:
+            pass
+
+        page.wait_for_timeout(1000)
+
+    # Timeout: el grid no apareció en 30 s
+    print(f"[{time.strftime('%H:%M:%S')}] ⏰ Timeout de {CHALLENGE_TIMEOUT} s sin listado después del desafío")
+    # Guardar captura y HTML para depuración
+    try:
+        debug_dir = Path("debug")
+        debug_dir.mkdir(exist_ok=True)
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        page.screenshot(path=debug_dir / f"turnstile-block-{timestamp}.png")
+        (debug_dir / f"turnstile-block-{timestamp}.html").write_text(
+            page.content(), encoding="utf-8", newline=""
+        )
+    except Exception:
+        pass
+    return f"Desafío de Turnstile detectado y no resuelto tras {CHALLENGE_TIMEOUT} s"
+
+
 def _resolve_cloudflare_challenge(page, response) -> str | None:
     """
     Resuelve el reto de Cloudflare automáticamente.
@@ -435,6 +502,19 @@ def wait_for_listing(page, response) -> str | None:
     Espera a que aparezcan las tarjetas. Devuelve None si el listado está
     disponible o un mensaje de error si sigue bloqueado / no hay listado.
     """
+    # --- NUEVO: Detectar desafío de Turnstile antes de la resolución automática ---
+    turnstile_result = _detect_turnstile_challenge(page)
+    if turnstile_result is not None:
+        # Se detectó un desafío y no se resolvió a tiempo → salir con código 2
+        raise ScraperError(
+            turnstile_result,
+            products=[],
+            ti_products=[],
+            skipped=[],
+            pages_scraped=0,
+        )
+    # --- Fin detección Turnstile ---
+
     # Primero, intentar resolver el reto de Cloudflare automáticamente por hasta 45 s
     result = _resolve_cloudflare_challenge(page, response)
     if result is not None:
@@ -479,6 +559,61 @@ def _launch_browser(p) -> tuple:
     )
     page = context.new_page()
     return browser, context, page
+
+
+def setup_mode(page, base_url: str) -> None:
+    """
+    Modo setup: abre Chrome visible con perfil persistente, carga el listado
+    y espera hasta 5 minutos a que aparezca #product-listing-product-grid.
+    El usuario marca la casilla a mano. Al aparecer el listado o al cerrar la
+    ventana, imprime el resultado y sale.
+    """
+    from pathlib import Path
+
+    print(f"[{time.strftime('%H:%M:%S')}] 🪟 Modo setup: Chrome visible con perfil persistente")
+    print(f"[{time.strftime('%H:%M:%S')}] 📄 Cargando: {base_url}")
+
+    # Navegar a la página principal
+    page.goto(base_url, timeout=60_000)
+
+    # Esperar a que aparezca el grid o hasta 5 minutos
+    grid_selector = "#product-listing-product-grid"
+    deadline = time.monotonic() + 300  # 5 minutos
+
+    while time.monotonic() < deadline:
+        try:
+            if page.locator(grid_selector).count() > 0:
+                print(f"[{time.strftime('%H:%M:%S')}] ✅ Listado detectado después de {int(time.monotonic() - deadline + 300)} s")
+                # Captura de pantalla para confirmación
+                try:
+                    debug_dir = Path("debug")
+                    debug_dir.mkdir(exist_ok=True)
+                    timestamp = time.strftime("%Y%m%d-%H%M%S")
+                    page.screenshot(path=debug_dir / f"setup-{timestamp}.png")
+                except Exception:
+                    pass
+                print(f"[{time.strftime('%H:%M:%S')}] 👋 Cierra la ventana del navegador para salir del modo setup")
+                # Esperar a que el usuario cierre la ventana
+                page.wait_for_event("close")
+                print(f"[{time.strftime('%H:%M:%S')}] 👋 Modo setup finalizado")
+                return
+        except Exception:
+            pass
+
+        remaining = int(deadline - time.monotonic())
+        if remaining % 30 == 0 or remaining <= 30:
+            print(f"[{time.strftime('%H:%M:%S')}] ⏳ Esperando listado... falta {remaining}s (máx 5 min)")
+
+        page.wait_for_timeout(1000)
+
+    # Timeout: el grid no apareció en 5 minutos
+    print(f"[{time.strftime('%H:%M:%S')}] ⏰ Timeout de 5 minutos sin detectar el listado")
+    print(f"[{time.strftime('%H:%M:%S')}] 👋 Cierra la ventana del navegador para salir del modo setup")
+    try:
+        page.wait_for_event("close")
+    except Exception:
+        pass
+    print(f"[{time.strftime('%H:%M:%S')}] 👋 Modo setup finalizado (timeout)")
 
 
 def build_product(card_data, specs: dict[str, str]) -> Product | None:
@@ -526,7 +661,6 @@ def load_history() -> list[dict]:
 
 def save_run(products_with_history: list[tuple[Product, list[dict]]]) -> dict:
     """Guarda el historial de la corrida actual."""
-    import json
     from datetime import datetime
 
     try:
@@ -651,6 +785,13 @@ def scrape():
 
         print(f"[{time.strftime('%H:%M:%S')}] ✅ Navegador abierto headless")
 
+        # Visitar la página de inicio antes de empezar (modo normal solo)
+        if not SETUP_MODE:
+            print(f"[{time.strftime('%H:%M:%S')}] 🏠 Visitando página de inicio: https://www.pccomponentes.com")
+            page.goto("https://www.pccomponentes.com", timeout=30_000)
+            # Pausa aleatoria 3-6 s para que cargen las cookies/perfil
+            page.wait_for_timeout(int(random.uniform(*HOMEPAGE_DELAY) * 1000))
+
         try:
             print(f"[{time.strftime('%H:%M:%S')}] 📄 Cargando página principal: {BASE_URL}")
             page.goto(BASE_URL, timeout=45_000)
@@ -742,6 +883,11 @@ def scrape():
                     page.goto(next_url, timeout=45_000)
                     pages_scraped += 1
 
+                    # Pausa aleatoria entre páginas: 4-9 s
+                    page_delay = random.uniform(*PAGE_DELAY)
+                    print(f"[{time.strftime('%H:%M:%S')}] ⏳ Pausa entre páginas {page_delay:.1f} s")
+                    page.wait_for_timeout(int(page_delay * 1000))
+
                     # Verificar bloqueo en la siguiente página
                     result = wait_for_listing(page, None)
                     if result is not None:
@@ -802,6 +948,11 @@ def main(argv: list[str] | None = None) -> int:
         "--no-save",
         action="store_true",
         help="No guarda el históríco en data/: solo muestra la tabla por consola.",
+    )
+    parser.add_argument(
+        "--setup",
+        action="store_true",
+        help="Abre Chrome visible con perfil persistente (.browser-profile/), carga el listado y espera hasta 5 minutos a que aparezca #product-listing-product-grid. Marca la casilla a mano. Al aparecer el listado o al cerrar la ventana, imprime el resultado y sale. Sirve para que las cookies de verificación queden en el perfil que luego usa el modo normal.",
     )
     args = parser.parse_args(argv)
 
