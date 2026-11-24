@@ -1,12 +1,9 @@
 #!/usr/bin/env node
-/** 
- * Build script para web/ - Genera web/public/data/prices.json
- * Lee data/history.csv y data/products.json desde la raíz del repositorio.
- * Genera web/public/data/prices.json con la serie completa de precios por SKU y estadísticas.
- * NUNCA inventa productos - solo usa datos reales
- * Usa TODAS las observaciones del histórico para min/max/promedio
- * Si hay < 3 días de historial, muestra datos reales con aviso
- * Si data/ vacío o inexistente, muestra estado vacío
+/**
+ * Build script para web/ - Genera web/public/data/prices.json y history.json
+ * Lee data/history.csv y data/products.json desde la raíz del repositorio
+ * (o desde la carpeta indicada por la variable de entorno DATA_DIR).
+ * NUNCA inventa productos - solo usa datos reales.
  */
 
 const fs = require('fs')
@@ -15,64 +12,236 @@ const path = require('path')
 // Rutas del repositorio (usando rutas relativas al script)
 const SCRIPT_DIR = path.resolve(__dirname)
 const REPO_ROOT = path.resolve(SCRIPT_DIR, '..', '..')
-const DATA_DIR = path.join(REPO_ROOT, 'data')
+const DATA_DIR = process.env.DATA_DIR
+  ? path.resolve(process.env.DATA_DIR)
+  : path.join(REPO_ROOT, 'data')
 const PUBLIC_DIR = path.resolve(SCRIPT_DIR, '..', 'public')
 const PUBLIC_DATA_DIR = path.join(PUBLIC_DIR, 'data')
 
 const HISTORY_FILE = path.join(DATA_DIR, 'history.csv')
 const PRODUCTS_FILE = path.join(DATA_DIR, 'products.json')
+// Fallback para pruebas con DATA_DIR: si la carpeta de datos alternativa no
+// trae products.json, se usan los metadatos reales del repositorio.
+const PRODUCTS_FALLBACK = path.join(REPO_ROOT, 'data', 'products.json')
 const PRICES_OUTPUT = path.join(PUBLIC_DATA_DIR, 'prices.json')
+const HISTORY_OUTPUT = path.join(PUBLIC_DATA_DIR, 'history.json')
 
 // Fechas fijas para los marcadores
 const BLACK_FRIDAY = new Date('2026-11-27')
 const CYBER_MONDAY = new Date('2026-11-30')
 const CHRISTMAS = new Date('2026-12-25')
 const REYES = new Date('2027-01-06')
-const JANUARY_SALES_START = new Date('2027-01-05')
+const JANUARY_SALES_START = new Date('2027-01-07')
 
-// Regex para extraer atributos del nombre del producto
-const ATTR_REGEX = {
-  cpu: /(Intel|AMD|Core|Ryzen)\s+\w+(?:\s+\w+)?/gi,
-  ram: /(\d+)\s*GB\s*RAM/gi,
-  ssd: /(\d+)\s*TB\s*SSD|(\d+)\s*GB\s*SSD/gi,
-  marca: /(PcCom|Vibox|PCM|Aeon|NeoPC|Gamer|Gaming|Centrum|IBUYPOWER|DeepGaming|NitroPC|Tecnowake|Epical-q)/gi,
-}
+// ---------------------------------------------------------------------------
+// CSV parser con soporte de campos entrecomillados (comas y saltos de línea)
+// ---------------------------------------------------------------------------
+function parseCSV(content) {
+  const text = content.replace(/^\uFEFF/, '')
+  const rows = []
+  let row = []
+  let field = ''
+  let inQuotes = false
 
-/** Extrae atributos del nombre del producto */
-function extractAttributes(name) {
-  const result = { cpu: '', ram: '', ssd: '', marca: '' }
-  const matches = name.match(ATTR_REGEX)
-  if (matches) {
-    for (const m of matches) {
-      const upper = m.toUpperCase()
-      if (/PCCOM|VIBOX|PCM|AEON|NEOPC|GAMER|GAMING|CENTRUM/i.test(m)) result.marca = m
-      if (/INTEL|AMD|CORE|RYZEN/i.test(m)) result.cpu = m
-      if (/\d+\s*GB\s*RAM/i.test(m)) result.ram = m
-      if (/\d+\s*TB\s*SSD|\d+\s*GB\s*SSD/i.test(m)) result.ssd = m
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]
+    if (inQuotes) {
+      if (ch === '"') {
+        if (text[i + 1] === '"') {
+          field += '"'
+          i++
+        } else {
+          inQuotes = false
+        }
+      } else {
+        field += ch
+      }
+      continue
+    }
+
+    if (ch === '"') {
+      inQuotes = true
+    } else if (ch === ',') {
+      row.push(field)
+      field = ''
+    } else if (ch === '\r') {
+      // ignorar CR; el salto lo marca \n
+    } else if (ch === '\n') {
+      row.push(field)
+      rows.push(row)
+      row = []
+      field = ''
+    } else {
+      field += ch
     }
   }
-  return result
+
+  if (field.length > 0 || row.length > 0) {
+    row.push(field)
+    rows.push(row)
+  }
+
+  // Convertir a objetos usando la primera fila como cabecera
+  if (rows.length === 0) return []
+  const headers = rows[0].map((h) => h.trim())
+  const out = []
+  for (let i = 1; i < rows.length; i++) {
+    const values = rows[i]
+    if (values.every((v) => String(v).trim() === '')) continue
+    const obj = {}
+    for (let j = 0; j < headers.length; j++) {
+      obj[headers[j]] = j < values.length ? values[j] : ''
+    }
+    out.push(obj)
+  }
+  return out
 }
 
-/** Detecta si la fecha es un hito conocido y devuelve la etiqueta */
+// ---------------------------------------------------------------------------
+// Extracción de atributos
+// ---------------------------------------------------------------------------
+function clean(value) {
+  return String(value).replace(/\s+/g, ' ').trim()
+}
+
+const CPU_RULES = [
+  { re: /\bIntel\s+Ultra\s+Core\s+[3579](?:[-\s]\d{3,4}[A-Z]{0,2})?\b/i, prefix: '' },
+  { re: /\bIntel\s+Ultra\s+[3579](?:[-\s]\d{3,4}[A-Z]{0,2})?\b/i, prefix: '' },
+  { re: /\bIntel\s+Core\s+Ultra\s+[3579](?:[-\s]\d{3,4}[A-Z]{0,2})?\b/i, prefix: '' },
+  { re: /\bCore\s+Ultra\s+[3579](?:[-\s]\d{3,4}[A-Z]{0,2})?\b/i, prefix: 'Intel ' },
+  { re: /\bIntel\s+Core\s+i[3579](?:[-\s]?\d{4,5}[A-Z]{0,2})?\b/i, prefix: '' },
+  { re: /\bIntel\s+i[3579](?:[-\s]?\d{4,5}[A-Z]{0,2})?\b/i, prefix: '' },
+  { re: /\bCore\s+i[3579](?:[-\s]?\d{4,5}[A-Z]{0,2})?\b/i, prefix: 'Intel ' },
+  { re: /\bi[3579][-\s]?\d{4,5}[A-Z]{0,2}\b/i, prefix: 'Intel Core ' },
+  { re: /\bAMD\s+Ryzen\s+(?:[3579]\s+)?\d{4}[A-Z0-9]{0,4}\b/i, prefix: '' },
+  { re: /\bRyzen\s+(?:[3579]\s+)?\d{4}[A-Z0-9]{0,4}\b/i, prefix: 'AMD ' },
+  { re: /\bAMD\s+R[3579][-\s]?\d{4}[A-Z0-9]*\b/i, prefix: '' },
+  { re: /\bAMD\s+Ryzen\s+[3579]\b/i, prefix: '' },
+]
+
+function extractCpu(name) {
+  for (const rule of CPU_RULES) {
+    const m = name.match(rule.re)
+    if (m) return clean(rule.prefix + m[0])
+  }
+  return ''
+}
+
+function extractRam(name) {
+  const re = /(\d+)\s*GB/gi
+  let m
+  let fallback = ''
+  while ((m = re.exec(name))) {
+    const idx = m.index
+    const prefix = name.slice(Math.max(0, idx - 10), idx)
+    const suffix = name.slice(idx + m[0].length, idx + m[0].length + 14)
+    const gb = parseInt(m[1], 10)
+
+    // VRAM: "RTX 5070 12GB" o "... Ti 16GB" (tamaños de VRAM habituales)
+    if (gb <= 24 && /5070\s*$/i.test(prefix)) continue
+    if (gb <= 24 && /\bTi\s*$/i.test(prefix)) continue
+    // Almacenamiento o VRAM explícita
+    if (/^\s*(?:GDDR|SSD|NVMe|HDD|M\.2|SATA)/i.test(suffix)) continue
+
+    const candidate = `${gb}GB`
+    // Preferir el que va seguido de RAM/DDR
+    if (/^\s*(?:RAM|DDR)/i.test(suffix)) return candidate
+    if (!fallback) fallback = candidate
+  }
+  return fallback
+}
+
+function extractSsd(name) {
+  let m = name.match(/(\d+)\s*(GB|TB)\s*(SSD|NVMe|M\.2)\b/i)
+  if (m) {
+    return formatStorage(m[1], m[2], m[3])
+  }
+  m = name.match(/\b(SSD|NVMe|M\.2)\s*(\d+)\s*(GB|TB)\b/i)
+  if (m) {
+    return formatStorage(m[2], m[3], m[1])
+  }
+  return ''
+}
+
+function formatStorage(size, unit, type) {
+  const u = unit.toUpperCase()
+  let t = type.toUpperCase()
+  if (t === 'NVME') t = 'NVMe'
+  return `${size}${u} ${t}`
+}
+
+const BRAND_RULES = [
+  [/neo\s*-?\s*pc/i, 'NeoPC'],
+  [/\bpc\s*com\b/i, 'PcCom'],
+  [/\bpc\s*(?:gaming\s*)?racing\b/i, 'PC Racing'],
+  [/\bepical\b/i, 'Epical-Q'],
+  [/\bi?buypower\b/i, 'IBUYPOWER'],
+  [/\bvibox\b/i, 'Vibox'],
+  [/\bvist\b/i, 'Vist'],
+  [/\btecnowake\b/i, 'Tecnowake'],
+  [/\bnitro\s*-?\s*pc\b/i, 'Nitropc'],
+  [/\bpcm\b/i, 'PCM'],
+  [/\bpcgam\b/i, 'PCGAM'],
+  [/\bdeep\s*gaming\b/i, 'DeepGaming'],
+  [/\bmegaman[ií]a\b/i, 'Megamania'],
+  [/\bgreed\b/i, 'GREED'],
+  [/\bbeastcom\b/i, 'BEASTCOM'],
+  [/\bzone\s*evil\b/i, 'Zone Evil'],
+  [/\bhur[aá]can\b/i, 'Huracan'],
+  [/\bmsi\b/i, 'MSI'],
+  [/\basus\b/i, 'ASUS'],
+  [/\blenovo\b/i, 'Lenovo'],
+  [/\bacer\b/i, 'Acer'],
+  [/\bcooler\s*master\b/i, 'Cooler Master'],
+  [/\baeon\b/i, 'Aeon'],
+  [/\bcentrum\b/i, 'Centrum'],
+  [/\bdaitona\b/i, 'Daitona'],
+  [/\bracing\b/i, 'PC Racing'],
+]
+
+function extractBrand(name) {
+  for (const [re, brand] of BRAND_RULES) {
+    if (re.test(name)) return brand
+  }
+  return ''
+}
+
+function extractAttributes(name) {
+  return {
+    cpu: extractCpu(name),
+    ram: extractRam(name),
+    ssd: extractSsd(name),
+    marca: extractBrand(name),
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Fechas / hitos
+// ---------------------------------------------------------------------------
 function isHito(date) {
-  const d = new Date(date)
-  if (d.getDate() === BLACK_FRIDAY.getDate() && d.getMonth() === BLACK_FRIDAY.getMonth())
+  const parts = String(date).slice(0, 10).split('-').map(Number)
+  if (parts.length !== 3 || parts.some(Number.isNaN)) return null
+  const [year, month, day] = parts
+
+  if (year === BLACK_FRIDAY.getFullYear() && month === BLACK_FRIDAY.getMonth() + 1 && day === BLACK_FRIDAY.getDate())
     return 'Black Friday (27/11)'
-  if (d.getDate() === CYBER_MONDAY.getDate() && d.getMonth() === CYBER_MONDAY.getMonth())
+  if (year === CYBER_MONDAY.getFullYear() && month === CYBER_MONDAY.getMonth() + 1 && day === CYBER_MONDAY.getDate())
     return 'Cyber Monday (30/11)'
-  if (d.getDate() === CHRISTMAS.getDate() && d.getMonth() === CHRISTMAS.getMonth())
+  if (year === CHRISTMAS.getFullYear() && month === CHRISTMAS.getMonth() + 1 && day === CHRISTMAS.getDate())
     return 'Navidad (25/12)'
-  if (d.getDate() === REYES.getDate() && d.getMonth() === REYES.getMonth())
+  if (year === REYES.getFullYear() && month === REYES.getMonth() + 1 && day === REYES.getDate())
     return 'Reyes (6/1)'
-  if (d >= JANUARY_SALES_START) return 'Rebajas enero'
+  if (year === 2027 && month === 1 && day >= JANUARY_SALES_START.getDate())
+    return 'Rebajas de enero'
   return null
 }
 
-/** Parses un precio string a número (quita €, separadores de miles) */
+// ---------------------------------------------------------------------------
+// Precios
+// ---------------------------------------------------------------------------
 function parsePrice(value) {
   if (value === null || value === undefined || value === '') return null
-  const text = String(value)
+  let text = String(value).replace(/\u00a0/g, ' ').trim()
 
   if (text.includes('€')) {
     text = text.replace('€', '').trim()
@@ -81,273 +250,221 @@ function parsePrice(value) {
   let processed = text
 
   if (processed.includes(',')) {
-    // Formato español: "1.799,00" -> 1799.00
     processed = processed.replace(/\./g, '').replace(',', '.')
-  } else if (processed.match(/^\d+\.\d{2}$/)) {
-    // Formato internacional exacto "2489.00"
+  } else if (/^\d+\.\d{2}$/.test(processed)) {
     processed = processed
-  } else if (processed.match(/^\d+\.\d{3}$/)) {
-    // Formato "1.799" (punto miles, sin decimales) -> 1799
+  } else if (/^\d+\.\d{3}$/.test(processed)) {
     processed = processed.replace(/\./g, '')
-  } else if (processed.match(/^\d+\.\d+$/) && processed.split('.')[1].length >= 3) {
-    // Punto decimal con 3+ dígitos: tratar como español
+  } else if (/^\d+\.\d+$/.test(processed) && processed.split('.')[1].length >= 3) {
     processed = processed.replace(/\./g, '').replace(',', '.')
   }
 
   const num = parseFloat(processed)
-  return isNaN(num) ? null : num
+  return Number.isNaN(num) ? null : num
 }
 
-/* --- CSV Parser simple (sin dependencias externas) --- */
-function parseCSV(content) {
-  const lines = content.split('\n').filter(l => l.trim().length > 0)
-  if (lines.length < 2) return []
-  const headers = lines[0].split(',').map(h => h.trim())
-  const rows = []
-  for (let i = 1; i < lines.length; i++) {
-    const values = lines[i].split(',').map(v => v.trim())
-    const row = {}
-    for (let j = 0; j < headers.length; j++) {
-      row[headers[j]] = j < values.length ? values[j] : ''
-    }
-    rows.push(row)
-  }
-  return rows
+function round(value) {
+  return Math.round(value * 100) / 100
 }
 
-/* --- Lógica principal --- */
+// ---------------------------------------------------------------------------
+// Lectura de datos
+// ---------------------------------------------------------------------------
+console.log(`DATA_DIR: ${DATA_DIR}`)
+
+const dataDirExists = fs.existsSync(DATA_DIR)
+if (!dataDirExists) {
+  console.log('data/ directory does not exist. Generating empty state.')
+  fs.mkdirSync(PUBLIC_DATA_DIR, { recursive: true })
+  fs.writeFileSync(PRICES_OUTPUT, JSON.stringify([], null, 2))
+  fs.writeFileSync(HISTORY_OUTPUT, JSON.stringify({}))
+  console.log('Generated prices.json and history.json with 0 products (empty state)')
+  process.exit(0)
+}
 
 let historyRows = []
 let products = {}
 
-// Verificar si data/ existe
-const dataDirExists = fs.existsSync(DATA_DIR)
-
-// Si data/ no existe, generar estado vacío
-if (!dataDirExists) {
-  console.log('data/ directory does not exist. Generating empty state.')
-  const emptyPrices = []
-  fs.mkdirSync(PUBLIC_DATA_DIR, { recursive: true })
-  fs.writeFileSync(PRICES_OUTPUT, JSON.stringify(emptyPrices, null, 2))
-  console.log('Generated prices.json with 0 products (empty state)')
-  process.exit(0)
-}
-
-// Leer history.csv
 try {
   const historyContent = fs.readFileSync(HISTORY_FILE, 'utf-8')
-  historyRows = parseCSV(historyContent).filter(r => r.fecha && r.sku)
+  historyRows = parseCSV(historyContent).filter((r) => r.fecha && r.sku)
   console.log(`Read ${historyRows.length} rows from history.csv`)
 } catch (e) {
   console.warn('No se pudo leer history.csv', e.message)
   historyRows = []
 }
 
-// Leer products.json
 try {
-  const productsContent = fs.readFileSync(PRODUCTS_FILE, 'utf-8')
+  let productsFile = PRODUCTS_FILE
+  if (!fs.existsSync(productsFile) && productsFile !== PRODUCTS_FALLBACK) {
+    productsFile = PRODUCTS_FALLBACK
+    console.log('products.json no está en DATA_DIR; usando data/products.json del repositorio')
+  }
+  const productsContent = fs.readFileSync(productsFile, 'utf-8')
   products = JSON.parse(productsContent)
-  console.log(`Read ${Object.keys(products).length} products from products.json`)
+  console.log(`Read ${Object.keys(products).length} products from ${productsFile}`)
 } catch (e) {
   console.warn('No se pudo leer products.json', e.message)
   products = {}
 }
 
-// Determinar fechas únicas en el historial
-const allFechas = [...new Set(historyRows.map(r => r.fecha))].sort()
-const numDiasHistorial = allFechas.length
-
-// Obtener lista de SKU reales (union de products.json y history.csv)
-const skuSetFromProducts = Object.keys(products).filter(sku => products[sku] && products[sku].name)
-const skuSetFromHistory = [...new Set(historyRows.map(r => r.sku))]
+// SKUs reales (union de products.json y history.csv)
+const skuSetFromProducts = Object.keys(products).filter(
+  (sku) => products[sku] && products[sku].name
+)
+const skuSetFromHistory = [...new Set(historyRows.map((r) => r.sku))]
 const allSkus = [...new Set([...skuSetFromProducts, ...skuSetFromHistory])]
 
 console.log(`Total de SKU a procesar: ${allSkus.length}`)
 
-// Construir precios para TODOS los productos reales
+// ---------------------------------------------------------------------------
+// Construcción de prices.json e history.json
+// ---------------------------------------------------------------------------
 const pricesData = []
+const historyMap = {}
 
 for (const sku of allSkus) {
   const product = products[sku]
   const name = product ? product.name : null
+  if (!name) continue
 
-  if (!name) {
-    // Producto en history.csv pero sin nombre en products.json - saltarlo
-    // Per requirements: never invent products, so skip
-    continue
-  }
+  const url = product && product.url ? product.url : ''
 
-  // Filtrar rows de histórico para este SKU (todos los registros reales), ordenados por fecha
-  const skuRows = historyRows.filter(r => r.sku === sku).sort(function (a, b) {
-    return new Date(a.fecha) - new Date(b.fecha)
-  })
-
-  if (skuRows.length === 0) {
-    // SKU en products.json pero sin histórico - incluir con precio actual null
-    pricesData.push({
-      sku,
-      name,
-      currentPrice: null,
-      previousPrice: null,
-      discount: null,
-      minPriceHistorico: null,
-      maxPriceHistorico: null,
-      variation7d: 0,
-      totalRegistros: 0,
-      attributes: extractAttributes(name),
-      hito: null,
-      esMuestra: false,
-      motivoMuestra: '',
-      datosReales: true,
-      showHistoryNote: false,
-      numDiasHistorial: 0,
-      priceSeries: [], //serie temporal para el chart
-      firstPrice: null,
-      lastPrice: null,
+  const skuRows = historyRows
+    .filter((r) => r.sku === sku && parsePrice(r.precio) !== null)
+    .sort((a, b) => {
+      const da = `${a.fecha} ${a.hora || ''}`
+      const db = `${b.fecha} ${b.hora || ''}`
+      return da < db ? -1 : da > db ? 1 : 0
     })
-    continue
+
+  // Una fila por fecha: el último registro del día. Así la variación es
+  // realmente "respecto al día anterior", no respecto a otro scrape del día.
+  const byDate = new Map()
+  for (const row of skuRows) {
+    byDate.set(row.fecha, row)
+  }
+  const dailyRows = [...byDate.values()]
+
+  // Serie compacta [fecha, precio] ordenada por fecha
+  const series = dailyRows.map((r) => [r.fecha, parsePrice(r.precio)])
+  if (series.length > 0) {
+    historyMap[sku] = series
   }
 
-  // Extraer precio actual: la observación más reciente (última fila al ordenar por fecha ascending)
-  // skuRows ya están ordenados ascending por fecha, así que la última es la más reciente
-  const currentPrice = parsePrice(skuRows[skuRows.length - 1].precio)
+  const lastRow = dailyRows.length > 0 ? dailyRows[dailyRows.length - 1] : null
+  const currentPrice = lastRow ? parsePrice(lastRow.precio) : null
 
-  // Usar la observación anterior a la última para previousPrice y discount
-  // Si hay al menos 2 observaciones, el previousPrice es la penúltima
-  let previousPrice = null
-  let discount = null
-  let priceSeries = []
-  
-  if (skuRows.length >= 2) {
-    previousPrice = parsePrice(skuRows[skuRows.length - 2].precio)
-    // Descuento respecto a la observación anterior (precio real histórico)
-    if (previousPrice !== null && currentPrice !== null && previousPrice > currentPrice) {
-      discount = round((previousPrice - currentPrice) / previousPrice * 100)
-    }
-  } else if (skuRows.length === 1) {
-    // Solo una observación: previousPrice es null, discount es null
-    // Pero podemos usar precio_anterior de la propia fila si existe
-    const singleRow = skuRows[0]
-    const prevFromRow = parsePrice(singleRow.precio_anterior)
-    if (prevFromRow !== null && currentPrice !== null && prevFromRow > currentPrice) {
-      discount = round((prevFromRow - currentPrice) / prevFromRow * 100)
-    }
+  // PVPR: precio tachado de la web en la última observación
+  let pvpr = lastRow ? parsePrice(lastRow.precio_anterior) : null
+  if (pvpr !== null && (currentPrice === null || pvpr <= currentPrice)) {
+    pvpr = null
   }
+  const discountPvpr =
+    pvpr !== null && currentPrice !== null && pvpr > currentPrice
+      ? round(((pvpr - currentPrice) / pvpr) * 100)
+      : null
 
-  // priceSeries: todas las observaciones de precio a lo largo del tiempo
-  // Ordenadas de más antigua a más reciente para el chart
-  priceSeries = skuRows.map(r => ({
-    fecha: r.fecha,
-    precio: parsePrice(r.precio) || null,
-    precio_anterior: parsePrice(r.precio_anterior) || null,
-    descuento: parseInt(r.descuento, 10) || null,
-  })).filter(s => s.precio !== null)
+  // Precio del día anterior (para bajada respecto al día anterior)
+  const previousPrice =
+    dailyRows.length >= 2 ? parsePrice(dailyRows[dailyRows.length - 2].precio) : null
+  const recentChangePct =
+    previousPrice !== null && currentPrice !== null && previousPrice > 0
+      ? round(((currentPrice - previousPrice) / previousPrice) * 100)
+      : null
+  const recentDropPct =
+    recentChangePct !== null && recentChangePct < 0 ? -recentChangePct : null
 
-  // firstPrice y lastPrice de la serie real
-  const firstPrice = priceSeries.length > 0 ? priceSeries[0].precio : null
-  const lastPrice = priceSeries.length > 0 ? priceSeries[priceSeries.length - 1].precio : null
+  // Serie de precios y min/max
+  const priceSeries = dailyRows.map((r) => parsePrice(r.precio))
+  const minPriceHistorico = priceSeries.length > 0 ? Math.min(...priceSeries) : null
+  const maxPriceHistorico = priceSeries.length > 0 ? Math.max(...priceSeries) : null
+  const firstPrice = priceSeries.length > 0 ? priceSeries[0] : null
+  const lastPrice = priceSeries.length > 0 ? priceSeries[priceSeries.length - 1] : null
 
-  // Descount final: usar previousPrice calculado arriba
-  // Si no se pudo calcular, intentar de la última fila completa
-  if (discount === null && priceSeries.length > 0) {
-    // Usar la penúltima observación como referencia de "antes"
-    if (priceSeries.length >= 2) {
-      const prevP = priceSeries[priceSeries.length - 2].precio
-      if (prevP !== null && currentPrice !== null && prevP > currentPrice) {
-        discount = round((prevP - currentPrice) / prevP * 100)
-      }
-    }
-  }
+  // Días con datos (fechas únicas del producto)
+  const numDiasHistorial = dailyRows.length
 
-  // Min/max histórico sobre TODAS las observaciones
-  const pricesValues = priceSeries.map(s => s.precio).filter(p => p !== null)
-  const minPriceHistorico = pricesValues.length > 0 ? Math.min(...pricesValues) : null
-  const maxPriceHistorico = pricesValues.length > 0 ? Math.max(...pricesValues) : null
+  const availability = lastRow && lastRow.disponibilidad ? lastRow.disponibilidad : ''
+  const lastUpdated =
+    lastRow && lastRow.fecha
+      ? `${lastRow.fecha}${lastRow.hora ? ' ' + lastRow.hora : ''}`
+      : null
+  const hito = lastRow && lastRow.fecha ? isHito(lastRow.fecha) : null
 
-  // Calcular variation7d basándonos en datos reales
-  // Buscar precios de los últimos 7 días disponibles
-  const variation7d = calculateVariation7d(skuRows, priceSeries)
-  
-  // Total de registros (días con datos)
-  const totalRegistros = skuRows.length
-
-  // Detectar el hito más reciente
-  const hitoMasRecente = skuRows.filter(r => r.fecha).sort(function (a, b) {
-    return new Date(a.fecha) - new Date(b.fecha)
-  }).reverse()[0]
-  const hitoInfo = hitoMasRecente ? isHito(hitoMasRecente.fecha) : null
-
-  // Determinar si mostrar nota de historial en construcción
-  const showHistoryNote = numDiasHistorial < 3
+  // Sparkline compacta: últimos 14 precios
+  const sparkline = priceSeries.slice(-14)
 
   pricesData.push({
     sku,
     name,
+    url,
     currentPrice,
+    pvpr,
+    discountPvpr,
     previousPrice,
-    discount,      // Descuento real basado en observaciones históricas
+    recentChangePct,
+    recentDropPct,
     minPriceHistorico,
     maxPriceHistorico,
-    variation7d,
-    totalRegistros,
+    firstPrice,
+    lastPrice,
+    totalRegistros: skuRows.length,
+    numDiasHistorial,
+    availability,
     attributes: extractAttributes(name),
-    hito: hitoInfo,
+    hito,
     esMuestra: false,
     motivoMuestra: '',
     datosReales: true,
-    showHistoryNote,
-    numDiasHistorial,
-    priceSeries, // Serie temporal completa para el chart
-    firstPrice,
-    lastPrice,
+    showHistoryNote: numDiasHistorial < 2,
+    lastUpdated,
+    sparkline,
   })
 }
 
-// Ordenar por SKU
-pricesData.sort(function (a, b) { return a.sku.localeCompare(b.sku) })
+// Ordenar por nombre para un orden estable
+pricesData.sort((a, b) => a.name.localeCompare(b.name, 'es'))
 
 // Asegurar directorio
 fs.mkdirSync(PUBLIC_DATA_DIR, { recursive: true })
 
-// Escribir fichero
+// Escribir ficheros
 fs.writeFileSync(PRICES_OUTPUT, JSON.stringify(pricesData, null, 2))
+fs.writeFileSync(HISTORY_OUTPUT, JSON.stringify(historyMap))
 console.log(`Generated prices.json con ${pricesData.length} productos (datos reales)`)
+console.log(`Generated history.json con ${Object.keys(historyMap).length} SKUs`)
 
-// Output summary
-const withNote = pricesData.filter(p => p.showHistoryNote).length
-console.log(` - Productos con historial < 3 días: ${withNote}`)
-console.log(` - Primer SKU: ${pricesData[0]?.sku}, Último SKU: ${pricesData[pricesData.length - 1]?.sku}`)
+// ---------------------------------------------------------------------------
+// Estadísticas de extracción de atributos
+// ---------------------------------------------------------------------------
+const total = pricesData.length
+const fields = ['cpu', 'ram', 'ssd', 'marca']
+const counts = { cpu: 0, ram: 0, ssd: 0, marca: 0 }
+const failures = []
 
-/** Calcula la variación porcentual en 7 días basándose en datos reales */
-function calculateVariation7d(skuRows, priceSeries) {
-  if (priceSeries.length < 2) return 0
-  
-  // Obtener la última precio de la serie
-  const lastPrice = priceSeries[priceSeries.length - 1].precio
-  if (lastPrice === null) return 0
-  
-  // Buscar el precio hace 7 días
-  // Las filas de history.csv tienen fechas, buscamos la fecha hace aproximadamente 7 días
-  const today = new Date()
-  const sevenDaysAgo = new Date(today)
-  sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7)
-  const sevenDaysAgoStr = sevenDaysAgo.toISOString().split('T')[0]
-  
-  // Encontrar la observación más cercana a hace 7 días
-  let price7DaysAgo = null
-  for (const row of skuRows.reverse()) {
-    const rowDate = new Date(row.fecha)
-    if (rowDate <= sevenDaysAgo) {
-      price7DaysAgo = parsePrice(row.precio)
-      break
-    }
+for (const p of pricesData) {
+  let missing = false
+  for (const f of fields) {
+    if (p.attributes[f]) counts[f] += 1
+    else missing = true
   }
-  
-  if (price7DaysAgo === null || lastPrice === null || price7DaysAgo === lastPrice) return 0
-  
-  return round((lastPrice - price7DaysAgo) / price7DaysAgo * 100)
+  if (missing) failures.push(p.name)
 }
 
-function round(value) {
-  return Math.round(value * 100) / 100
+function pct(n) {
+  return total > 0 ? ((n / total) * 100).toFixed(1) : '0.0'
+}
+
+console.log(`\nAtributos detectados (${total} productos):`)
+console.log(`  CPU:   ${counts.cpu} (${pct(counts.cpu)}%)`)
+console.log(`  RAM:   ${counts.ram} (${pct(counts.ram)}%)`)
+console.log(`  SSD:   ${counts.ssd} (${pct(counts.ssd)}%)`)
+console.log(`  Marca: ${counts.marca} (${pct(counts.marca)}%)`)
+
+if (failures.length > 0) {
+  console.log(`\nNombres con algún atributo sin detectar (${failures.length}):`)
+  failures.forEach((n) => console.log(`  - ${n}`))
+} else {
+  console.log('\nTodos los productos tienen CPU, RAM, SSD y marca detectados.')
 }

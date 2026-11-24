@@ -2,6 +2,13 @@ import React from 'react'
 import ReactDOM from 'react-dom/client'
 import App from './App'
 
+import '@fontsource/public-sans/400.css'
+import '@fontsource/public-sans/500.css'
+import '@fontsource/public-sans/600.css'
+import '@fontsource/jetbrains-mono/400.css'
+import '@fontsource/jetbrains-mono/500.css'
+import './style.css'
+
 // ============================================================
 // Error boundary: evita la "pantalla en gris" si el render falla
 // ============================================================
@@ -26,51 +33,27 @@ class ErrorBoundary extends React.Component<
   render() {
     if (this.state.error) {
       return (
-        <div
-          role="alert"
-          style={{
-            margin: '2rem auto',
-            maxWidth: '640px',
-            padding: '1.5rem',
-            fontFamily: 'system-ui, sans-serif',
-            color: '#f8fafc',
-            background: '#1e293b',
-            border: '1px solid #ef4444',
-            borderRadius: '8px',
-          }}
-        >
-          <h1 style={{ marginTop: 0, fontSize: '1.25rem' }}>
-            Se ha producido un error
-          </h1>
-          <p style={{ marginBottom: '1rem' }}>
-            La aplicación no ha podido mostrarse correctamente.
-          </p>
+        <div role="alert" className="empty empty--detail" style={{ margin: '3rem auto', maxWidth: 620 }}>
+          <h1>Se ha producido un error</h1>
+          <p>La aplicación no ha podido mostrarse correctamente.</p>
           <pre
             style={{
               whiteSpace: 'pre-wrap',
               wordBreak: 'break-word',
-              fontSize: '0.8rem',
-              background: '#0f172a',
+              fontSize: '0.78rem',
+              fontFamily: 'var(--font-mono)',
+              color: 'var(--text-dim)',
+              background: 'var(--ground-deep)',
+              border: '1px solid var(--line)',
               padding: '0.75rem',
-              borderRadius: '6px',
+              borderRadius: 2,
+              margin: 0,
+              width: '100%',
             }}
           >
             {this.state.error.message}
           </pre>
-          <button
-            type="button"
-            onClick={() => window.location.reload()}
-            style={{
-              marginTop: '1rem',
-              padding: '0.5rem 1rem',
-              cursor: 'pointer',
-              borderRadius: '6px',
-              border: 'none',
-              background: '#22c55e',
-              color: '#0f172a',
-              fontWeight: 600,
-            }}
-          >
+          <button type="button" className="btn btn--primary" onClick={() => window.location.reload()}>
             Recargar
           </button>
         </div>
@@ -94,12 +77,7 @@ if (!faviconLink) {
 faviconLink.type = 'image/svg+xml'
 faviconLink.href = faviconHref
 
-// Manejo de routing hash simple para páginas de detalle
-// #/product?sku=XXXXX  o  #/product/SKU
-
-const url = window.location.hash
-const detailSku = url ? url.replace('#/product/', '') : ''
-
+// El enrutado por hash (#/, #/listado, #/product/SKU) vive en App.
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <ErrorBoundary>
@@ -107,18 +85,3 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
     </ErrorBoundary>
   </React.StrictMode>
 )
-
-// Si hay un SKU en el hash, actualizar la UI para mostrar el detalle
-if (detailSku) {
-  const event = new Event('hashchange')
-  window.dispatchEvent(event)
-}
-
-// Escuchar cambios de hash para navegación SPA
-window.addEventListener('hashchange', () => {
-  const newUrl = window.location.hash
-  const newSku = newUrl ? newUrl.replace('#/product/', '') : ''
-  document.dispatchEvent(new CustomEvent('product:sku:change', {
-    detail: { sku: newSku }
-  }))
-})
