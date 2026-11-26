@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 pc-price-tracker
-================
+===============
 
 Scraper de PCs de sobremesa con RTX 5070 en PcComponentes.
 
@@ -10,20 +10,25 @@ Uso (modo manual diario):
     python scraper.py --headless       # modo headless (Chrome o Chromium)
 
 El scraper se ejecuta SIEMPRE a mano en la PC con Chrome visible. No usa GitHub
-Actions ni cron. Los resultados se muestran por consola y, si se consigue,
-los datos se guardan en data/.
+Actions ni cron. Los resultados se muestran por consola y, si se consiguen,
+los datos se guardan en data/. El scraper se conecta a Chrome ya abierto
+por el usuario en http://127.0.0.1:9222.
 """
 
 from __future__ import annotations
 
+import random
 import argparse
 import csv
+import json
+import math
+import os
 import re
-import random
 import sys
 import time
-import os
+import faulthandler
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from playwright.sync_api import Error as PlaywrightError
@@ -34,27 +39,6 @@ from playwright.sync_api import sync_playwright
 # ---------------------------------------------------------------------------
 
 BASE_URL = "https://www.pccomponentes.com/categorias/sobremesa/geforce-rtx-5070"
-
-# User-Agent de Chrome real (sin la marca "HeadlessChrome" que pondría Playwright).
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/159.0.0.0 Safari/537.36"
-)
-LOCALE = "es-ES"
-TIMEZONE = "Europe/Madrid"
-
-# --- Modo y perfil ---
-HEADLESS = False  #Visible por defecto; --headless invierte este valor
-
-# Canal de Chrome: "chrome" usa el Chrome instalado, "chromium" usa Chromium
-CHROME_CHANNEL = "chrome"  # "chrome" o "chromium"; usa el installed Chrome si está disponible
-
-# Perfil de Chrome persistente, configurable mediante PCT_PROFILE_DIR
-PCT_PROFILE_DIR = os.environ.get(
-    "PCT_PROFILE_DIR",
-    os.path.join(os.environ.get("LOCALAPPDATA", ""), "pc-price-tracker", "browser-profile"),
-)
-PROFILE_DIR = PCT_PROFILE_DIR  # Ya resuelto al importar
 
 # --- Retos de Cloudflare / Turnstile ---
 # Espera máxima tras detectar desafío de Turnstile: 5 minutos a que aparezca el listado
@@ -75,7 +59,18 @@ BLOCK_MARKERS = (
 
 # Histórico de precios. Las rutas se resuelven respecto a este fichero para que
 # el scraper funcione igual desde cualquier directorio de trabajo.
-DATA_DIR = Path(__file__).resolve().parent / "data"
+DEFAULT_DATA_DIR = Path(__file__).resolve().parent / "data"
+
+
+def _env_data_dir() -> Path:
+    """Directorio de datos configurado con PCT_DATA_DIR (si existe)."""
+    raw = os.environ.get("PCT_DATA_DIR", "").strip()
+    if not raw:
+        return DEFAULT_DATA_DIR
+    return Path(raw).expanduser().resolve()
+
+
+DATA_DIR = _env_data_dir()
 PRODUCTS_FILE = DATA_DIR / "products.json"
 HISTORY_FILE = DATA_DIR / "history.csv"
 HISTORY_FIELDS = (
@@ -87,6 +82,21 @@ HISTORY_FIELDS = (
     "descuento",
     "disponibilidad",
 )
+
+# Volcado de seguridad con los productos recogidos, justo antes de guardar.
+DEBUG_DIR = Path(__file__).resolve().parent / "debug"
+LAST_SCRAPE_FILE = DEBUG_DIR / "last_scrape.json"
+
+
+def configure_data_dir(path: str | Path | None) -> None:
+    """Cambia el directorio de datos en tiempo de ejecución (--data-dir)."""
+    global DATA_DIR, PRODUCTS_FILE, HISTORY_FILE
+    if path is None:
+        DATA_DIR = _env_data_dir()
+    else:
+        DATA_DIR = Path(path).expanduser().resolve()
+    PRODUCTS_FILE = DATA_DIR / "products.json"
+    HISTORY_FILE = DATA_DIR / "history.csv"
 
 # Nuevo: campos de especificaciones extraídas del nombre del producto
 SPEC_REGEX = {
@@ -100,27 +110,71 @@ SPEC_REGEX = {
     ),
 }
 
+# Detección estricta de RTX 5070 Ti: exige "5070" seguido (con espacio o guion
+# opcional) de "ti" como palabra completa. No debe confundirse con "Ultimate",
+# "Titan", "Fireborn", etc.
+RTX_5070_TI_RE = re.compile(r"5070\s*[-]?\s*ti\b", re.IGNORECASE)
+
 GRID_SELECTOR = "#product-listing-product-grid"
 CARD_SELECTOR = f"{GRID_SELECTOR} a[data-product-id]"
+
+# --- Paginación ---
+# El listado se sirve con ?page=N y 40 artículos por página.
+ITEMS_PER_PAGE = 40
+MAX_PAGES = 25
+
+# --- Watchdog ---
+# Si pasan 120 s sin progreso, faulthandler vuelca la pila de todos los hilos y
+# termina el proceso (exit code 1) en lugar de quedarse colgado.
+WATCHDOG_TIMEOUT = 120
+
+# Expresión usada con page.wait_for_function después de cada page.goto.
+WAIT_CARDS_EXPR = (
+    "document.querySelectorAll('#product-listing-product-grid a[data-product-id]').length > 0"
+)
+
+# JS autocontenido (sin argumentos): número de tarjetas del DOM.
+CARD_COUNT_JS = f"() => document.querySelectorAll('{CARD_SELECTOR}').length"
+
+# JS autocontenido: total de artículos del listado ("648 artículos").
+TOTAL_ITEMS_JS = r"""
+() => {
+  const text = document.body ? (document.body.innerText || '') : '';
+  const match = text.match(/(\d[\d.\s]*)\s*art[ií]culos/i);
+  if (!match) return null;
+  const digits = match[1].replace(/[^\d]/g, '');
+  if (!digits) return null;
+  const total = parseInt(digits, 10);
+  return Number.isFinite(total) ? total : null;
+}
+"""
+
+# JS autocontenido: sondeo del reto de Turnstile.
+TURNSTILE_PROBE_JS = r"""
+() => {
+  const body = document.body ? (document.body.innerText || '') : '';
+  return {
+    body_text: body.toLowerCase(),
+    title: (document.title || '').toLowerCase(),
+    turnstile_iframes: document.querySelectorAll(
+      "iframe[title*='turnstile'], iframe[src*='turnstile']"
+    ).length,
+  };
+}
+"""
+
+# JS autocontenido: texto de la página para buscar marcadores de bloqueo.
+PAGE_TEXT_JS = r"""
+() => {
+  const body = document.body ? (document.body.innerText || '') : '';
+  return (body + ' ' + (document.title || '')).toLowerCase();
+}
+"""
 
 
 # ---------------------------------------------------------------------------
 # Utilidades varias
 # ---------------------------------------------------------------------------
-
-def profile_is_locked(profile_path: str) -> bool:
-    """Comprueba si el perfil de Chrome ya está en uso (archivo de bloqueo)."""
-    import msvcrt
-    lock_file = os.path.join(profile_path, "Singleton", "Lock")
-    try:
-        # Intentar abrir el archivo de bloqueo; si falla, el perfil está libre
-        f = open(lock_file, "r")
-        msvcrt.locking(f.fileno(), msvcrt.LK_NBLOCK, 1)
-        f.close()
-        return False
-    except (FileNotFoundError, OSError):
-        return True
-
 
 def format_price(value: float | None) -> str:
     if value is None:
@@ -129,6 +183,11 @@ def format_price(value: float | None) -> str:
     # 1,799.00 -> 1.799,00
     formatted = formatted.replace(",", "\x00").replace(".", ",").replace("\x00", ".")
     return f"{formatted} €"
+
+
+def is_rtx_5070_ti(name: str) -> bool:
+    """True solo si el nombre contiene una RTX 5070 Ti real."""
+    return bool(RTX_5070_TI_RE.search(name or ""))
 
 
 def extract_specifications(name: str) -> dict[str, str]:
@@ -226,6 +285,17 @@ class Product:
         return round((self.previous_price - self.price) / self.previous_price * 100)
 
 
+@dataclass
+class ScrapeStats:
+    """Métricas del recorrido para comparar tarjetas leídas y artículos del listado."""
+
+    pages_scraped: int = 0
+    cards_total: int = 0
+    unique_skus: int = 0
+    duplicate_cards: int = 0
+    listing_total: int | None = None
+
+
 class ScraperError(RuntimeError):
     """Error controlado: se muestra un mensaje claro y se detiene la ejecución."""
 
@@ -237,89 +307,93 @@ class ScraperError(RuntimeError):
         ti_products: list[Product] | None = None,
         skipped: list[str] | None = None,
         pages_scraped: int = 0,
+        stats: "ScrapeStats | None" = None,
     ) -> None:
         super().__init__(message)
         self.products = products or []
         self.ti_products = ti_products or []
         self.skipped = skipped or []
         self.pages_scraped = pages_scraped
+        self.stats = stats
 
 
 # ---------------------------------------------------------------------------
 # Punto de entrada y flujo principal
 # ---------------------------------------------------------------------------
 
-def _check_profile_lock(profile_path: str) -> bool:
+def _connect_to_chrome_cdp() -> tuple:
     """
-    Intenta lanzar un contexto de Chrome con ese perfil.
-    Si falla por bloqueo de perfil, devuelve True.
-    Playwright levantará un error si el perfil está bloqueado.
+    Conecta a Chrome existente vía CDP en http://127.0.0.1:9222.
+
+    Reutiliza la pestaña que el usuario ya tiene abierta en
+    pccomponentes.com/categorias (la visible). Si no existe, abre una nueva y la
+    trae al frente.
+
+    Devuelve (browser, context, page, page_created) o sale con código 2 si no
+    hay conexión.
     """
-    # En Windows, Chrome crea un archivo de bloqueo en el directorio del perfil
-    # Comprobación simple: mirar si existe el archivo Singleton/Lock
-    lock_path = os.path.join(profile_path, "Singleton", "Lock")
-    if os.path.exists(lock_path):
-        try:
-            # Intentar leer el archivo: si otro proceso lo tiene, puede que falle
-            # o que tenga contenido. Solo es una comprobación preventiva.
-            with open(lock_path, "r") as f:
-                content = f.read()
-            # Si el archivo existe y tiene contenido, es probable que esté en uso
-            return bool(content.strip())
-        except Exception:
-            return True
-    return False
-
-
-def _launch_browser(p) -> tuple:
-    """Lanza el navegador y devuelve (browser, context, page)."""
-
-    profile_path = Path(PROFILE_DIR)
-    profile_path.mkdir(parents=True, exist_ok=True)
-
-    # Comprobación de perfil bloqueado ANTES de lanzar el navegador
-    if _check_profile_lock(str(profile_path)):
+    try:
+        p = sync_playwright().start()
+        browser = p.chromium.connect_over_cdp("http://127.0.0.1:9222")
+        # Usar el contexto existente (el primer contexto del usuario)
+        context = browser.contexts[0]
+    except Exception:
         print(
-            f"[{time.strftime('%H:%M:%S')}] ⚠️ Perfil de Chrome en uso por otro proceso "
-            f"(directorio: {PROFILE_DIR}). Cierre esa instancia y vuelva a intentar.",
+            f"[{time.strftime('%H:%M:%S')}] ❌ No se pudo conectar a Chrome en http://127.0.0.1:9222",
             file=sys.stderr,
         )
-        return None, None, None
+        print(
+            "    Asegúrate de haber lanzado Chrome con --remote-debugging-port=9222",
+            file=sys.stderr,
+        )
+        print("    Ejecuta update_prices.ps1 para iniciar Chrome con depuración remota.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
-    # Usar el channel de Chrome instalado si está disponible, fallback a Chromium
-    if CHROME_CHANNEL == "chrome":
-        browser = p.chromium.launch(headless=HEADLESS, channel="chrome")
-    else:
-        browser = p.chromium.launch(headless=HEADLESS, channel="chromium")
+    # Buscar la pestaña del listado que el usuario tiene abierta
+    page = None
+    for candidate in context.pages:
+        try:
+            if "pccomponentes.com/categorias" in (candidate.url or ""):
+                page = candidate
+                break
+        except Exception:
+            continue
 
-    context = browser.new_context(
-        user_agent=USER_AGENT,
-        # Directorio de perfil persistente: las cookies y estado se guardan aquí
-        user_data_dir=str(profile_path),
-    )
+    if page is not None:
+        print(
+            f"[{time.strftime('%H:%M:%S')}] ♻️ Reutilizando pestaña abierta: {page.url}"
+        )
+        return browser, context, page, False
+
     page = context.new_page()
-    return browser, context, page
+    try:
+        page.bring_to_front()
+    except Exception:
+        pass
+    return browser, context, page, True
 
 
 def _handle_turnstile_challenge(page) -> bool:
     """
-    Detecta el reto de Turnstile de Cloudflare.
-    Imprime mensaje y espera hasta 5 minutos a que aparezca #product-listing-product-grid.
+    Detecta el reto de Turnstile de Cloudflare usando page.evaluate (sin Locators).
+    Imprime mensaje y espera hasta 5 minutos a que aparezca el listado.
     Devuelve True si el listado apareció (continuar), False si timeout (salir con código 2).
     """
     challenge_text_markers = ["verificación de seguridad en curso", "turnstile"]
-    challenge_iframes = page.locator("iframe[title*='turnstile'], iframe[src*='turnstile']")
 
-    # Verificar si aparece el texto de desafío en el body o título
     try:
-        body_text = page.locator("body").inner_text(timeout=3_000).lower()
-        title = page.title().lower()
+        probe = page.evaluate(TURNSTILE_PROBE_JS)
     except Exception:
-        body_text = ""
-        title = ""
+        probe = {}
+
+    body_text = str(probe.get("body_text") or "")
+    title = str(probe.get("title") or "")
+    turnstile_iframes = int(probe.get("turnstile_iframes") or 0)
 
     hay_desafío_texto = any(marker in body_text or marker in title for marker in challenge_text_markers)
-    hay_iframe_turnstile = challenge_iframes.count() > 0
+    hay_iframe_turnstile = turnstile_iframes > 0
 
     if not hay_desafío_texto and not hay_iframe_turnstile:
         return True  # No hay desafío, continuar
@@ -330,20 +404,15 @@ def _handle_turnstile_challenge(page) -> bool:
     print(f"[{time.strftime('%H:%M:%S')}] ⏳ Esperando listado hasta {CHALLENGE_TIMEOUT} s...")
 
     deadline = time.monotonic() + CHALLENGE_TIMEOUT
-    appeared = False
 
     while time.monotonic() < deadline:
-        try:
-            if page.locator(CARD_SELECTOR).count() > 0:
-                print(f"[{time.strftime('%H:%M:%S')}] ✅ Listado apareció después del desafío")
-                appeared = True
-                break
-        except Exception:
-            pass
+        # Rearmar el watchdog en cada sondeo: el usuario puede tardar hasta 5 min
+        # en resolver el reto, pero un evaluate colgado sigue matando el proceso.
+        _arm_watchdog()
+        if _count_cards(page) > 0:
+            print(f"[{time.strftime('%H:%M:%S')}] ✅ Listado apareció después del desafío")
+            return True
         page.wait_for_timeout(1000)
-
-    if appeared:
-        return True
 
     # Timeout: el grid no apareció en 5 minutos
     print(f"[{time.strftime('%H:%M:%S')}] ⏰ Timeout de {CHALLENGE_TIMEOUT} s sin listado después del desafío")
@@ -361,45 +430,80 @@ def _handle_turnstile_challenge(page) -> bool:
     return False
 
 
+def _count_cards(page) -> int:
+    """Número de tarjetas del listado, leído con page.evaluate (sin Locators)."""
+    try:
+        return int(page.evaluate(CARD_COUNT_JS))
+    except Exception:
+        return 0
+
+
+def _page_looks_blocked(page) -> bool:
+    """Comprueba marcadores de bloqueo/captcha en el texto de la página."""
+    try:
+        text = str(page.evaluate(PAGE_TEXT_JS) or "")
+    except Exception:
+        return False
+    return any(marker in text for marker in BLOCK_MARKERS)
+
+
+def _detect_listing_totals(page) -> tuple[int | None, int | None]:
+    """
+    Lee el total de artículos del listado ("648 artículos") y calcula el nº de
+    páginas (total / 40, redondeando hacia arriba).
+
+    Devuelve (total_articulos, total_paginas). Ambos son None si no se puede leer.
+    """
+    try:
+        total_items = page.evaluate(TOTAL_ITEMS_JS)
+    except Exception:
+        return None, None
+
+    if not isinstance(total_items, (int, float)) or total_items <= 0:
+        return None, None
+    total = int(total_items)
+    return total, max(1, math.ceil(total / ITEMS_PER_PAGE))
+
+
+def _page_url(page_num: int) -> str:
+    """URL del listado para una página concreta (?page=1, ?page=2, ...)."""
+    return f"{BASE_URL}?page={page_num}"
+
+
+def _arm_watchdog() -> None:
+    """Cancela el watchdog anterior y lo rearma (120 s sin progreso → exit)."""
+    try:
+        faulthandler.cancel_dump_traceback_later()
+    except Exception:
+        pass
+    faulthandler.dump_traceback_later(WATCHDOG_TIMEOUT, exit=True)
+
+
 def wait_for_listing(page) -> bool:
     """
     Espera a que aparezcan las tarjetas.
     Devuelve True si el listado está disponible, False si hay bloqueo/timeout.
     """
-    # --- NUEVO: Detectar desafío de Turnstile antes de cualquier cosa ---
-    turnstile_result = _handle_turnstile_challenge(page)
-    if not turnstile_result:
+    # Detectar desafío de Turnstile antes de cualquier cosa
+    if not _handle_turnstile_challenge(page):
         # Timeout en el desafío → salir con código 2, sin escribir en data/
         return False
-    # --- Fin detección Turnstile ---
 
-    # Si llegamos aquí, el desafío se resolvió (o no había). Ahora esperar confirmación
-    # del grid (máx 10 s adicionales)
-    deadline = time.monotonic() + 10.0
-    while time.monotonic() < deadline:
-        try:
-            if page.locator(CARD_SELECTOR).count() > 0:
-                return True
-        except PlaywrightError:
-            pass
-        page.wait_for_timeout(500)
-
-    # Ya no llamamos a detect_block aquí. Si el grid aún no apareció, es bloqueo real.
-    return False
-
-
-def _next_page_url(page) -> str | None:
-    """Obtiene la URL de la siguiente página, o None si no hay más."""
+    # Esperar el grid tras el page.goto (sin Locators)
     try:
-        next_btn = page.locator(".next-page, a.next, span.next")
-        if next_btn.count() > 0 and next_btn.is_visible():
-            href = next_btn.get_attribute("href")
-            if href:
-                from urllib.parse import urljoin
-                return urljoin(BASE_URL, href)
+        page.wait_for_function(WAIT_CARDS_EXPR, timeout=30_000)
+        return True
     except Exception:
         pass
-    return None
+
+    # Margen extra por si el listado aparece justo después del timeout
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        if _count_cards(page) > 0:
+            return True
+        page.wait_for_timeout(500)
+
+    return False
 
 
 def scrape() -> tuple:
@@ -407,42 +511,41 @@ def scrape() -> tuple:
     Ejecuta el scrapeo completo de la lista de productos de RTX 5070.
 
     Returns:
-        tuple: (products, ti_products, skipped, pages_scraped)
+        tuple: (products, ti_products, skipped, stats)
     """
     products = []
     ti_products = []
     skipped = []
-    pages_scraped = 0
+    stats = ScrapeStats()
+    seen_skus: set[str] = set()
 
     global_start = time.monotonic()
     global_timeout = 12 * 60  # 12 minutos global
 
-    with sync_playwright() as p:
-        browser, context, page = _launch_browser(p)
+    browser, context, page, page_created = _connect_to_chrome_cdp()
 
-        # Asegurar cierre en finally a continuación
-        if browser is None:
-            print(f"[{time.strftime('%H:%M:%S')}] ❌ No se pudo lanzar el navegador (perfil bloqueado).", file=sys.stderr)
-            raise ScraperError(
-                "No se pudo lanzar el navegador por perfil bloqueado",
-                products=products,
-                ti_products=ti_products,
-                skipped=skipped,
-                pages_scraped=pages_scraped,
-            )
+    print(f"[{time.strftime('%H:%M:%S')}] ✅ Conectado a Chrome del usuario")
 
-        print(f"[{time.strftime('%H:%M:%S')}] ✅ Navegador abierto visible con perfil persistente")
-
+    # --- Configuración de timeouts y watchdog ---
+    context.set_default_timeout(30_000)
+    page.set_default_navigation_timeout(45_000)
+    if page_created:
         try:
-            # --- Visitar la home de PcComponentes antes de empezar ---
-            print(f"[{time.strftime('%H:%M:%S')}] 🏠 Visitando página de inicio: https://www.pccomponentes.com")
-            page.goto("https://www.pccomponentes.com", timeout=30_000)
-            # Pausa aleatoria 3-6 s para que cargen las cookies/perfil
-            homepage_delay = random.uniform(3, 6)
-            print(f"[{time.strftime('%H:%M:%S')}] ⏳ Pausa en home {homepage_delay:.1f} s")
-            page.wait_for_timeout(int(homepage_delay * 1000))
+            page.bring_to_front()
+        except Exception:
+            pass
 
-            # --- Cargar la página principal de RTX 5070 ---
+    # Watchdog: 120 s sin progreso → volcar la pila y terminar el proceso.
+    _arm_watchdog()
+
+    try:
+        detected_pages: int | None = None
+        total_pages = MAX_PAGES
+        truncated = False
+        ended_empty = False
+        page_num = 1
+
+        while page_num <= total_pages:
             elapsed = time.monotonic() - global_start
             if elapsed > global_timeout:
                 print(f"[{time.strftime('%H:%M:%S')}] ⏰ Límite global de 12 minutos alcanzado", file=sys.stderr)
@@ -451,159 +554,230 @@ def scrape() -> tuple:
                     products=products,
                     ti_products=ti_products,
                     skipped=skipped,
-                    pages_scraped=pages_scraped,
+                    pages_scraped=stats.pages_scraped,
+                    stats=stats,
                 )
 
-            print(f"[{time.strftime('%H:%M:%S')}] 📄 Cargando página principal: {BASE_URL}")
-            page.goto(BASE_URL, timeout=45_000)
-            pages_scraped = 1
+            url = _page_url(page_num)
+            if page_num == 1:
+                print(f"[{time.strftime('%H:%M:%S')}] 📄 Cargando página principal: {url}")
+            else:
+                print(f"[{time.strftime('%H:%M:%S')}] 📄 Cargando página {page_num}: {url}")
 
-            # Esperar a que aparezcan las tarjetas (usa wait_for_listing que incluye Turnstile)
-            print(f"[{time.strftime('%H:%M:%S')}] ⏳ Esperando a que aparezca el listado de productos...")
+            page.goto(url, timeout=45_000)
+
+            # Tras cada goto: esperar a que el grid tenga tarjetas (Turnstile incluido).
             if not wait_for_listing(page):
-                # Ya imprimió su propio mensaje y guardó debug; salir con código 2
+                # Una página sin tarjetas puede ser el final natural del listado.
+                if (
+                    page_num > 1
+                    and _count_cards(page) == 0
+                    and not _page_looks_blocked(page)
+                ):
+                    print(
+                        f"[{time.strftime('%H:%M:%S')}] 📄 La página {page_num} no tiene "
+                        "tarjetas: fin del listado"
+                    )
+                    ended_empty = True
+                    break
                 raise ScraperError(
-                    "Desafío de Cloudflare no resuelto o bloqueo detectado",
+                    f"Desafío de Cloudflare no resuelto o bloqueo detectado en la página {page_num}",
                     products=products,
                     ti_products=ti_products,
                     skipped=skipped,
-                    pages_scraped=pages_scraped,
+                    pages_scraped=stats.pages_scraped,
+                    stats=stats,
                 )
 
-            print(f"[{time.strftime('%H:%M:%S')}] 📄 Página principal cargada, listo para recorrer páginas")
-
-            while pages_scraped < 30:  # MAX_PAGES tope de seguridad
-                # Extraer productos de la página actual usando el JS de extracción
-                try:
-                    cards = page.locator(CARD_SELECTOR).element_handles()
-                except Exception:
-                    cards = []
-                card_count = len(cards)
-                if card_count == 0:
-                    break
-
-                # Ejecutar extracción en todas las tarjetas a la vez
-                card_data_list = page.evaluate(EXTRACT_JS, cards)
-
-                for i in range(card_count):
-                    card_data = card_data_list[i]
-                    try:
-                        # Build specifications from name
-                        specs = extract_specifications(card_data.get('card_text') or '')
-
-                        # Build Product object
-                        product = build_product(card_data, specs)
-
-                        if product is not None:
-                            if product.name.lower().find('ti') >= 0 or product.gpu.lower().find('ti') >= 0:
-                                ti_products.append(product)
-                            else:
-                                products.append(product)
-                    except Exception:
-                        skipped.append(card_data.get('sku', 'unknown') or f'card-{i}')
-                        continue
-
-                    # Intentar navegar a la siguiente página
-                    next_url = _next_page_url(page)
-                    if next_url is None:
-                        break
-
-                    # Verificar tiempo global
-                    elapsed = time.monotonic() - global_start
-                    if elapsed > global_timeout:
-                        print(f"[{time.strftime('%H:%M:%S')}] ⏰ Límite global de 12 minutos alcanzado", file=sys.stderr)
-                        raise ScraperError(
-                            "Límite global de 12 minutos alcanzado",
-                            products=products,
-                            ti_products=ti_products,
-                            skipped=skipped,
-                            pages_scraped=pages_scraped,
-                        )
-
-                    print(f"[{time.strftime('%H:%M:%S')}] 📄 Cargando página {pages_scraped + 1}")
-                    page.goto(next_url, timeout=45_000)
-                    pages_scraped += 1
-
-                    # Pausa aleatoria entre páginas: 4-9 s
-                    page_delay = random.uniform(4, 9)
-                    print(f"[{time.strftime('%H:%M:%S')}] ⏳ Pausa entre páginas {page_delay:.1f} s")
-                    page.wait_for_timeout(int(page_delay * 1000))
-
-                    # Verificar bloqueo en la siguiente página
-                    if not wait_for_listing(page):
-                        # Ya imprimió mensaje y guardó debug; salir con código 2
-                        raise ScraperError(
-                            "Desafío de Cloudflare no resuelto o bloqueo detectado en página subsiguiente",
-                            products=products,
-                            ti_products=ti_products,
-                            skipped=skipped,
-                            pages_scraped=pages_scraped,
-                        )
-
-        except ScraperError:
-            raise
-        except Exception as e:
-            # Si hay error inesperado, guardar debug antes de cerrar
-            try:
-                debug_dir = Path("debug")
-                debug_dir.mkdir(exist_ok=True)
-                timestamp = time.strftime("%Y%m%d-%H%M%S")
-                if page is not None:
-                    page.screenshot(path=debug_dir / f"block-{timestamp}.png")
-                    (debug_dir / f"block-{timestamp}.html").write_text(
-                        page.content(), encoding="utf-8", newline=""
+            # En la primera página se lee el total de artículos ("648 artículos")
+            # y se calcula el nº de páginas (40 artículos/página).
+            if page_num == 1:
+                listing_total, detected_pages = _detect_listing_totals(page)
+                stats.listing_total = listing_total
+                if detected_pages is None:
+                    print(
+                        f"[{time.strftime('%H:%M:%S')}] 📊 No se pudo leer el total de "
+                        "artículos: se recorrerá hasta una página sin tarjetas"
                     )
+                else:
+                    print(
+                        f"[{time.strftime('%H:%M:%S')}] 📊 Listado: "
+                        f"{listing_total} artículos → {detected_pages} páginas "
+                        f"({ITEMS_PER_PAGE} artículos/página)"
+                    )
+                    if detected_pages > MAX_PAGES:
+                        truncated = True
+                        print(
+                            f"[{time.strftime('%H:%M:%S')}] ⚠️ El listado supera el límite "
+                            f"de {MAX_PAGES} páginas",
+                            file=sys.stderr,
+                        )
+                    total_pages = min(detected_pages, MAX_PAGES)
+
+            # Extraer productos con JS autocontenido (sin Locators ni ElementHandles).
+            try:
+                card_data_list = page.evaluate(EXTRACT_JS_SELF_CONTAINED)
             except Exception:
-                pass
+                card_data_list = []
+
+            if not card_data_list:
+                if detected_pages is not None and page_num < detected_pages:
+                    raise ScraperError(
+                        f"La página {page_num} no devolvió tarjetas y se esperaban "
+                        f"{detected_pages} páginas: datos incompletos",
+                        products=products,
+                        ti_products=ti_products,
+                        skipped=skipped,
+                        pages_scraped=stats.pages_scraped,
+                    stats=stats,
+                    )
+                break
+
+            stats.cards_total += len(card_data_list)
+
+            for i, card_data in enumerate(card_data_list):
+                sku = str(card_data.get("sku") or "").strip()
+                if sku:
+                    if sku in seen_skus:
+                        stats.duplicate_cards += 1
+                        continue
+                    seen_skus.add(sku)
+
+                try:
+                    # Build specifications from name
+                    specs = extract_specifications(card_data.get('card_text') or '')
+
+                    # Build Product object
+                    product = build_product(card_data, specs)
+
+                    if product is not None:
+                        # Detección estricta: "Ultimate" o "Titan" no son Ti.
+                        if is_rtx_5070_ti(product.name):
+                            ti_products.append(product)
+                        else:
+                            products.append(product)
+                except Exception:
+                    skipped.append(sku or f'card-{i}')
+
+            stats.pages_scraped = page_num
+            stats.unique_skus = len(seen_skus)
+            print(
+                f"[{time.strftime('%H:%M:%S')}] ✅ Página {page_num} completada: "
+                f"{len(card_data_list)} tarjetas"
+            )
+
+            # Página completada: cancelar y rearmar el watchdog.
+            _arm_watchdog()
+
+            # Pausa aleatoria entre páginas: 4-9 s
+            if page_num < total_pages:
+                page_delay = random.uniform(4, 9)
+                print(f"[{time.strftime('%H:%M:%S')}] ⏳ Pausa entre páginas {page_delay:.1f} s")
+                page.wait_for_timeout(int(page_delay * 1000))
+
+            page_num += 1
+
+        # No se escriben datos si el recorrido quedó incompleto.
+        if truncated:
             raise ScraperError(
-                f"Error durante el scrapeo: {e}",
+                f"Listado incompleto: hay {detected_pages} páginas y el límite es {MAX_PAGES}",
                 products=products,
                 ti_products=ti_products,
                 skipped=skipped,
-                pages_scraped=pages_scraped,
+                pages_scraped=stats.pages_scraped,
+                stats=stats,
             )
-        finally:
-            # Siempre cerrar context y browser
+        if ended_empty and detected_pages is not None and stats.pages_scraped < detected_pages:
+            raise ScraperError(
+                f"Listado incompleto: se recorrieron {stats.pages_scraped} de {detected_pages} páginas",
+                products=products,
+                ti_products=ti_products,
+                skipped=skipped,
+                pages_scraped=stats.pages_scraped,
+                stats=stats,
+            )
+
+    except ScraperError:
+        raise
+    except Exception as e:
+        # Si hay error inesperado, guardar debug antes de cerrar
+        try:
+            debug_dir = Path("debug")
+            debug_dir.mkdir(exist_ok=True)
+            timestamp = time.strftime("%Y%m%d-%H%M%S")
+            if page is not None:
+                page.screenshot(path=debug_dir / f"block-{timestamp}.png")
+                (debug_dir / f"block-{timestamp}.html").write_text(
+                    page.content(), encoding="utf-8", newline=""
+                )
+        except Exception:
+            pass
+        raise ScraperError(
+            f"Error durante el scrapeo: {e}",
+            products=products,
+            ti_products=ti_products,
+            skipped=skipped,
+            pages_scraped=stats.pages_scraped,
+            stats=stats,
+        )
+    finally:
+        # Cancelar el watchdog de faulthandler
+        try:
+            faulthandler.cancel_dump_traceback_later()
+        except Exception:
+            pass
+        # Cerrar solo la pestaña si la abrimos nosotros (nunca la del usuario)
+        if page_created:
             try:
-                if context is not None:
-                    context.close()
+                page.close()
             except Exception:
                 pass
-            try:
-                if browser is not None:
-                    browser.close()
-            except Exception:
-                pass
+        # Desconectar browser de CDP (no cierra la ventana de Chrome del usuario)
+        try:
+            browser.close()
+        except Exception:
+            pass
 
-    return products, ti_products, skipped, pages_scraped
+    return (
+        sorted(products, key=lambda product: product.name.lower()),
+        sorted(ti_products, key=lambda product: product.name.lower()),
+        skipped,
+        stats,
+    )
 
 
-# JS de extracción (igual que antes)
-EXTRACT_JS = r"""
-(cards) => cards.map((card) => {
-  const query = (selector) => card.querySelector(selector);
-  const delivery = query('[data-testid="product-card-delivery"]');
-  const crossed = query('[data-e2e="crossedPrice"]');
-  const price = query('[data-e2e="price-card"]');
-  const nameEl = query('[data-product-name]');
-  const imageEl = query('[data-product-image]');
+# JS de extracción autocontenido: selecciona las tarjetas desde la página
+# en lugar de recibir ElementHandles como argumento (lo que causaba el cuelgue).
+EXTRACT_JS_SELF_CONTAINED = r"""
+() => {
+  const grid = document.querySelector('#product-listing-product-grid');
+  if (!grid) return [];
+  const cards = grid.querySelectorAll('a[data-product-id]');
+  return Array.from(cards).map((card) => {
+    const query = (selector) => card.querySelector(selector);
+    const delivery = query('[data-testid="product-card-delivery"]');
+    const crossed = query('[data-e2e="crossedPrice"]');
+    const priceEl = query('[data-e2e="price-card"]');
+    const nameEl = query('[data-product-name]');
+    const imageEl = query('[data-product-image]');
 
-  return {
-    sku: card.getAttribute('data-product-id') || '',
-    name: nameEl?.getAttribute('data-product-name') || card.getAttribute('data-product-name') || '',
-    url: card.href || '',
-    price: card.getAttribute('data-product-price')
-      || (price ? price.textContent : ''),
-    previous_price: crossed ? crossed.textContent : '',
-    delivery: delivery
-      ? (delivery.innerText || '').replace(/\s+/g, ' ').trim()
-      : '',
-    card_text: (card.innerText || '').replace(/\s+/g, ' ').trim(),
-    image_url: imageEl ? imageEl.src || '' : '',
-    // Atributos adicionales que podrían estar en el texto o en data-attributes
-    full_text: (card.innerText || '').replace(/\s+/g, ' ').trim(),
-  };
-})
+    return {
+      sku: card.getAttribute('data-product-id') || '',
+      name: nameEl?.getAttribute('data-product-name') || card.getAttribute('data-product-name') || '',
+      url: card.href || '',
+      price: card.getAttribute('data-product-price')
+        || (priceEl ? priceEl.textContent : ''),
+      previous_price: crossed ? crossed.textContent : '',
+      delivery:
+        delivery
+          ? (delivery.innerText || '').replace(/\\s+/g, ' ').trim()
+          : '',
+      card_text: (card.innerText || '').replace(/\\s+/g, ' ').trim(),
+      image_url: imageEl ? imageEl.src || '' : '',
+      full_text: (card.innerText || '').replace(/\\s+/g, ' ').trim(),
+    };
+  });
+}
 """
 
 
@@ -620,7 +794,7 @@ EXTRACT_JS = r"""
 # _resolve_cloudflare_challenge se eliminan ya que ahora el manejo es exclusivamente
 # via Turnstile + wait_for_listing.
 
-# Continuamos con las dataclasses y utilidades que sí se usan...
+# Continuamos con las dataclasses y utilidades que sí usamos...
 
 @dataclass(frozen=True)
 class EnhancedProduct:
@@ -714,96 +888,433 @@ def build_product(card_data, specs: dict[str, str]) -> Product | None:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Histórico en disco
+# ---------------------------------------------------------------------------
+
+
 def load_history() -> list[dict]:
     """Carga el histórico de precios desde el fichero CSV."""
-    history = []
-    if HISTORY_FILE.exists():
-        try:
-            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-                reader = csv.DictReader(f, fieldnames=HISTORY_FIELDS)
-                for row in reader:
-                    history.append(row)
-        except Exception:
-            pass
-    return history
-
-
-def save_run(products_with_history: list[tuple[Product, list[dict]]]) -> dict:
-    """Guarda el historial de la corrida actual."""
-    from datetime import datetime
+    if not HISTORY_FILE.exists():
+        return []
 
     try:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with open(HISTORY_FILE, "r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            columns = reader.fieldnames or []
+            if not columns:
+                return []  # fichero vacío
+            missing = [field for field in HISTORY_FIELDS if field not in columns]
+            if missing:
+                raise OSError(
+                    f"{HISTORY_FILE} no tiene las columnas esperadas "
+                    f"(faltan: {', '.join(missing)})"
+                )
 
-        # Leer histórico existente
-        history = load_history()
+            history = []
+            for row in reader:
+                if not any(
+                    str(value).strip()
+                    for value in row.values()
+                    if value is not None
+                ):
+                    continue  # línea en blanco
+                history.append(
+                    {
+                        field: (row.get(field) or "").strip()
+                        for field in HISTORY_FIELDS
+                    }
+                )
+            return history
+    except OSError:
+        raise
+    except (UnicodeDecodeError, csv.Error) as exc:
+        raise OSError(f"No se pudo leer {HISTORY_FILE}: {exc}") from exc
 
-        # Añadir nuevas observaciones
-        ahora = datetime.now()
+
+def history_row(product: Product, fecha: str, hora: str) -> dict[str, str]:
+    """Fila del CSV con el formato de siempre (precios con 2 decimales)."""
+    return {
+        "fecha": fecha,
+        "hora": hora,
+        "sku": product.sku,
+        "precio": "" if product.price is None else f"{product.price:.2f}",
+        "precio_anterior": (
+            "" if product.previous_price is None else f"{product.previous_price:.2f}"
+        ),
+        "descuento": (
+            "" if product.discount_pct is None else str(product.discount_pct)
+        ),
+        "disponibilidad": product.availability,
+    }
+
+
+def _write_history(rows: list[dict]) -> None:
+    """Escritura atómica del CSV (mismas columnas y CRLF que el histórico actual)."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    tmp_file = HISTORY_FILE.with_name(HISTORY_FILE.name + ".tmp")
+    try:
+        with open(tmp_file, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=HISTORY_FIELDS)
+            writer.writeheader()
+            writer.writerows(rows)
+        tmp_file.replace(HISTORY_FILE)
+    except Exception:
+        try:
+            tmp_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def save_run(products: list[Product], *, now: datetime | None = None) -> dict:
+    """
+    Guarda la observación actual en el histórico.
+
+    - Si ya hay filas de esa misma fecha, se reemplazan (no se duplican).
+    - Si la fecha es nueva, se añaden al final.
+    - Los precios se escriben con 2 decimales, como siempre.
+    """
+    try:
+        if not products:
+            raise OSError("No hay productos que guardar.")
+
+        ahora = now or datetime.now()
         fecha_str = ahora.strftime("%Y-%m-%d")
         hora_str = ahora.strftime("%H:%M:%S")
 
-        for product, _ in products_with_history:
-            # Buscar si ya existe una fila para este SKU en la fecha de hoy
-            hoy_exists = any(
-                row.get("sku") == product.sku and row.get("fecha") == fecha_str
-                for row in history
-            )
-            if not hoy_exists:
-                history.append({
-                    "fecha": fecha_str,
-                    "hora": hora_str,
-                    "sku": product.sku,
-                    "precio": product.price if product.price is not None else "",
-                    "precio_anterior": product.previous_price if product.previous_price is not None else "",
-                    "descuento": "",
-                    "disponibilidad": product.availability,
-                })
+        # Deduplicar por SKU por si la entrada viene de un JSON externo.
+        unique_products: list[Product] = []
+        seen: set[str] = set()
+        for product in products:
+            if product.sku:
+                if product.sku in seen:
+                    continue
+                seen.add(product.sku)
+            unique_products.append(product)
 
-        # Escribir historial actualizado
-        # Escritura atómica: escribir a temp y renombrar
-        tmp_file = HISTORY_FILE.with_suffix(".tmp")
-        with open(tmp_file, "w", encoding="utf-8", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=HISTORY_FIELDS)
-            writer.writerows(history)
-        tmp_file.replace(HISTORY_FILE)
-
-        # Return summary
-        new_entries = sum(
-            1 for _, _ in products_with_history
-            if any(row.get("sku") == product.sku and row.get("fecha") == fecha_str
-                   for row in history)
-            for product in [product for product, _ in products_with_history]
-        )
-        return {
-            "total_products": len(products_with_history),
-            "new_entries": new_entries,
-            "date": fecha_str,
+        history = load_history()
+        previous_skus = {
+            row["sku"] for row in history if row["fecha"] != fecha_str
         }
-    except Exception as e:
-        # Si falla, removemos el temp y levantamos error
+        replaced_rows = sum(1 for row in history if row["fecha"] == fecha_str)
+
+        # Solo se conservan las filas de otras fechas; las de esta fecha se sustituyen.
+        kept_rows = [row for row in history if row["fecha"] != fecha_str]
+        today_rows = [
+            history_row(product, fecha_str, hora_str)
+            for product in sorted(unique_products, key=lambda item: item.sku)
+        ]
+        # Orden cronológico por fecha y SKU, igual que el histórico existente.
+        rows = sorted(kept_rows + today_rows, key=lambda row: (row["fecha"], row["sku"]))
+
+        _write_history(rows)
+
+        return {
+            "date": fecha_str,
+            "time": hora_str,
+            "total_products": len(unique_products),
+            "new_skus": sum(
+                1 for product in unique_products if product.sku not in previous_skus
+            ),
+            "replaced_rows": replaced_rows,
+            "history_rows": len(rows),
+            "history_dates": len({row["fecha"] for row in rows}),
+            "history_file": str(HISTORY_FILE),
+        }
+    except OSError as exc:
+        raise OSError(f"Error guardando el historial: {exc}") from exc
+    except Exception as exc:
+        raise OSError(f"Error guardando el historial: {exc}") from exc
+
+
+# ---------------------------------------------------------------------------
+# Volcado de seguridad y reimportación desde JSON
+# ---------------------------------------------------------------------------
+
+
+def _product_to_dict(product: Product) -> dict:
+    return {
+        "sku": product.sku,
+        "name": product.name,
+        "url": product.url,
+        "price": product.price,
+        "previous_price": product.previous_price,
+        "availability": product.availability,
+        "cpu": product.cpu,
+        "ram": product.ram,
+        "ssd": product.ssd,
+        "gpu": product.gpu,
+        "marca": product.marca,
+    }
+
+
+def _write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_file = path.with_name(path.name + ".tmp")
+    try:
+        with open(tmp_file, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        tmp_file.replace(path)
+    except Exception:
         try:
             tmp_file.unlink(missing_ok=True)
-        except Exception:
+        except OSError:
             pass
-        raise OSError(f"Error guardando el historial: {e}")
+        raise
 
 
-def print_results(products, ti_products, skipped, pages_scraped, elapsed, partial: bool = False) -> None:
+def dump_last_scrape(
+    products: list[Product],
+    ti_products: list[Product],
+    skipped: list[str],
+    stats: ScrapeStats,
+    *,
+    now: datetime,
+    path: Path = LAST_SCRAPE_FILE,
+) -> None:
+    """Vuelca los productos recogidos a debug/last_scrape.json antes de guardar."""
+    payload = {
+        "schema_version": 1,
+        "generated_at": now.isoformat(timespec="seconds"),
+        "fecha": now.strftime("%Y-%m-%d"),
+        "hora": now.strftime("%H:%M:%S"),
+        "pages_scraped": stats.pages_scraped,
+        "cards_total": stats.cards_total,
+        "unique_skus": stats.unique_skus,
+        "duplicate_cards": stats.duplicate_cards,
+        "listing_total": stats.listing_total,
+        "skipped": skipped,
+        "products": [_product_to_dict(product) for product in products],
+        "ti_products": [_product_to_dict(product) for product in ti_products],
+    }
+    _write_text_atomic(
+        path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    )
+    print(f"[{time.strftime('%H:%M:%S')}] 💾 Volcado de seguridad: {path}")
+
+
+def _as_int(value: object) -> int:
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0
+
+
+def _json_product_items(data: object) -> tuple[list[dict], dict]:
+    """
+    Acepta tres formatos:
+      - lista de productos,
+      - objeto con las claves "products" y/o "ti_products",
+      - mapping SKU -> {name, url, ...} (formato de data/products.json).
+    """
+    if isinstance(data, list):
+        return [item for item in data if isinstance(item, dict)], {}
+
+    if isinstance(data, dict):
+        if "products" in data or "ti_products" in data:
+            items: list[dict] = []
+            for key in ("products", "ti_products"):
+                value = data.get(key)
+                if isinstance(value, list):
+                    items.extend(item for item in value if isinstance(item, dict))
+                elif isinstance(value, dict):
+                    for sku, item in value.items():
+                        if isinstance(item, dict):
+                            items.append({"sku": str(sku), **item})
+            return items, data
+
+        # data/products.json: {"10650846": {"name": ..., "url": ...}}
+        items = []
+        for sku, item in data.items():
+            if isinstance(item, dict):
+                items.append({"sku": str(sku), **item})
+        return items, {}
+
+    raise ValueError("El JSON debe ser una lista u objeto de productos")
+
+
+def _product_from_json_item(item: dict) -> Product | None:
+    name = str(item.get("name") or "").strip()
+    if not name:
+        return None
+
+    sku = str(item.get("sku") or item.get("id") or "").strip()
+    specs = extract_specifications(name)
+    for key in ("cpu", "ram", "ssd", "gpu", "marca"):
+        value = item.get(key)
+        if value:
+            specs[key] = str(value)
+
+    availability = str(item.get("availability") or item.get("delivery") or "")
+    return Product(
+        sku=sku,
+        name=name,
+        url=str(item.get("url") or ""),
+        price=parse_price(item.get("price")),
+        previous_price=parse_price(item.get("previous_price")),
+        availability=clean_availability(availability, ""),
+        cpu=specs.get("cpu", ""),
+        ram=specs.get("ram", ""),
+        ssd=specs.get("ssd", ""),
+        gpu=specs.get("gpu", ""),
+        marca=specs.get("marca", ""),
+    )
+
+
+def load_scrape_json(path: Path) -> tuple[
+    list[Product], list[Product], list[str], ScrapeStats, str | None, str | None
+]:
+    """
+    Carga un JSON de productos y los reclasifica con la regex estricta de Ti.
+
+    Devuelve (products, ti_products, skipped, stats, fecha, hora).
+    """
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise OSError(f"No se pudo leer {path}: {exc}") from exc
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"JSON inválido en {path}: {exc}") from exc
+
+    items, meta = _json_product_items(data)
+
+    products: list[Product] = []
+    ti_products: list[Product] = []
+    seen: set[str] = set()
+    for item in items:
+        product = _product_from_json_item(item)
+        if product is None:
+            continue
+        if product.sku:
+            if product.sku in seen:
+                continue
+            seen.add(product.sku)
+        if is_rtx_5070_ti(product.name):
+            ti_products.append(product)
+        else:
+            products.append(product)
+
+    skipped_raw = meta.get("skipped")
+    skipped = (
+        [str(value) for value in skipped_raw]
+        if isinstance(skipped_raw, list)
+        else []
+    )
+
+    listing_raw = meta.get("listing_total")
+    listing_total = _as_int(listing_raw) if listing_raw is not None else None
+    if listing_total is not None and listing_total <= 0:
+        listing_total = None
+
+    cards_total = _as_int(meta.get("cards_total")) or len(items)
+    unique_skus = len(seen) or (len(products) + len(ti_products))
+    duplicate_cards = _as_int(meta.get("duplicate_cards"))
+    if not duplicate_cards:
+        duplicate_cards = max(0, len(items) - unique_skus)
+
+    stats = ScrapeStats(
+        pages_scraped=_as_int(meta.get("pages_scraped")),
+        cards_total=cards_total,
+        unique_skus=unique_skus,
+        duplicate_cards=duplicate_cards,
+        listing_total=listing_total,
+    )
+
+    fecha = str(meta.get("fecha") or "").strip() or None
+    hora = str(meta.get("hora") or "").strip() or None
+    if fecha:
+        try:
+            datetime.strptime(fecha, "%Y-%m-%d")
+        except ValueError:
+            fecha = None
+    if hora:
+        try:
+            datetime.strptime(hora, "%H:%M:%S")
+        except ValueError:
+            hora = None
+
+    products.sort(key=lambda product: product.name.lower())
+    ti_products.sort(key=lambda product: product.name.lower())
+    return products, ti_products, skipped, stats, fecha, hora
+
+
+def timestamp_from_json(fecha: str | None, hora: str | None) -> datetime:
+    """Reconstruye la fecha/hora del volcado; si no es válida, usa ahora."""
+    if not fecha:
+        return datetime.now()
+    time_part = hora or datetime.now().strftime("%H:%M:%S")
+    try:
+        return datetime.strptime(f"{fecha} {time_part}", "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return datetime.now()
+
+
+def print_results(
+    products,
+    ti_products,
+    skipped,
+    stats: ScrapeStats | None,
+    elapsed,
+    partial: bool = False,
+    *,
+    saving: bool = True,
+) -> None:
     """Imprime los resultados del scrapeo en la consola."""
     print("pc-price-tracker · PCs de sobremesa con RTX 5070 · PcComponentes")
     print(f"Listado: {BASE_URL}")
-    print(f"Guardado: {'desactivado (--no-save)' if partial else 'activado (data/)'}")
+    if partial:
+        save_state = "no se guarda (ejecución parcial)"
+    elif saving:
+        save_state = f"activado ({DATA_DIR})"
+    else:
+        save_state = "desactivado (--no-save)"
+    print(f"Guardado: {save_state}")
     print()
 
     total = len(products) + len(ti_products)
-    print(f"Total: {total} PCs")
-    print(f"Ofertas TI: {len(ti_products)}")
-    print(f"Productos normales: {len(products)}")
+    cards_total = stats.cards_total if stats and stats.cards_total else total
+    unique_skus = stats.unique_skus if stats and stats.unique_skus else total
+    duplicate_cards = stats.duplicate_cards if stats else 0
+    pages_scraped = stats.pages_scraped if stats else 0
+
+    print(f"Tarjetas leídas: {cards_total}")
+    print(f"SKUs únicos: {unique_skus}")
+    print(f"Tarjetas duplicadas: {duplicate_cards}")
+    print(f"PCs RTX 5070 (sin Ti): {len(products)}")
+    print(f"PCs RTX 5070 Ti: {len(ti_products)}")
     print(f"Páginas recorridas: {pages_scraped}")
     print(f"Tiempo: {elapsed:.1f} s")
-    print()
 
+    if stats and stats.listing_total is not None:
+        listing_total = stats.listing_total
+        print()
+        print(f"Listado según la web: {listing_total} artículos")
+        print(f"Diferencia tarjetas - listado: {cards_total - listing_total:+d}")
+        print(f"Diferencia SKUs únicos - listado: {unique_skus - listing_total:+d}")
+        if duplicate_cards:
+            print(
+                f"  {duplicate_cards} tarjeta(s) repetida(s) entre páginas explican "
+                "el exceso de tarjetas."
+            )
+        if unique_skus < listing_total:
+            print(
+                "  El contador del listado es una foto del momento; puede incluir "
+                "artículos que no llegaron a renderizarse."
+            )
+
+    print()
+    if ti_products:
+        print(f"RTX 5070 Ti detectadas ({len(ti_products)}):")
+        for product in ti_products:
+            print(f"  {product.sku} · {product.name}")
+    else:
+        print("RTX 5070 Ti detectadas (0): ninguna")
+
+    print()
     print("-" * 100)
     print(f"{'SKU':<15} {'Nombre':<40} {'Precio':<12} {'Disponibilidad':<20}")
     print("-" * 100)
@@ -829,10 +1340,13 @@ def print_save_summary(summary: dict) -> None:
     print("-" * 50)
     print("Resumen de guardado")
     print("-" * 50)
-    print(f"Fecha: {summary.get('date', 'N/A')}")
-    print(f"Productos totales: {summary.get('total_products', 0)}")
-    print(f"Nuevas entradas: {summary.get('new_entries', 0)}")
-    print("Historial guardado en: data/history.csv")
+    print(f"Fecha: {summary.get('date', 'N/A')} {summary.get('time', '')}".rstrip())
+    print(f"Productos guardados: {summary.get('total_products', 0)}")
+    print(f"SKUs nuevos: {summary.get('new_skus', 0)}")
+    print(f"Filas reemplazadas del mismo día: {summary.get('replaced_rows', 0)}")
+    print(f"Filas en histórico: {summary.get('history_rows', 0)}")
+    print(f"Fechas en histórico: {summary.get('history_dates', 0)}")
+    print(f"Historial guardado en: {summary.get('history_file', HISTORY_FILE)}")
 
 
 # ---------------------------------------------------------------------------
@@ -843,43 +1357,100 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Scraper de PCs de sobremesa con RTX 5070 en PcComponentes, "
-            "con históríco de precios en data/."
+            "con histórico de precios en data/."
         )
     )
     parser.add_argument(
         "--no-save",
         action="store_true",
-        help="No guarda el históríco en data/: solo muestra la tabla por consola.",
+        help="No guarda el histórico: solo muestra la tabla por consola.",
     )
     parser.add_argument(
         "--headless",
         action="store_true",
         help="Modo headless (sin interfaz gráfica). Por defecto Chrome visible.",
     )
-    # Se elimina el flag --setup (ya no hace falta)
+    parser.add_argument(
+        "--from-json",
+        type=Path,
+        metavar="RUTA",
+        help=(
+            "No scrapea: carga los productos de RUTA y ejecuta solo el resumen "
+            "y el guardado."
+        ),
+    )
+    parser.add_argument(
+        "--data-dir",
+        type=Path,
+        metavar="DIR",
+        help=(
+            "Directorio de datos alternativo (history.csv). También se puede "
+            "configurar con la variable de entorno PCT_DATA_DIR."
+        ),
+    )
     args = parser.parse_args(argv)
+
+    if args.data_dir is not None:
+        configure_data_dir(args.data_dir)
 
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-    # Aplicar modo headless si se pidió
-    global HEADLESS
-    HEADLESS = args.headless
-
-    # Mostrar la ruta del perfil que se va a usar
-    print(f"[{time.strftime('%H:%M:%S')}] 📁 Perfil de Chrome: {PROFILE_DIR}")
+    print(f"[{time.strftime('%H:%M:%S')}] 📁 Directorio de datos: {DATA_DIR}")
 
     started = time.monotonic()
     print("pc-price-tracker · PCs de sobremesa con RTX 5070 · PcComponentes")
     print(f"Listado: {BASE_URL}")
+    if args.from_json:
+        print(f"Modo: --from-json {args.from_json} (sin scrapeo)")
     print(
         "Guardado: "
-        + ("desactivado (--no-save)" if args.no_save else "activado (data/)")
+        + ("desactivado (--no-save)" if args.no_save else f"activado ({DATA_DIR})")
     )
     print()
 
+    if args.from_json:
+        try:
+            products, ti_products, skipped, stats, fecha, hora = load_scrape_json(
+                args.from_json
+            )
+        except (OSError, ValueError) as exc:
+            print(f"\n[ERROR] {exc}", file=sys.stderr)
+            return 1
+
+        print_results(
+            products,
+            ti_products,
+            skipped,
+            stats,
+            time.monotonic() - started,
+            saving=not args.no_save,
+        )
+
+        if args.no_save:
+            return 0
+        if not products:
+            print(
+                "\n[AVISO] El JSON no contiene productos RTX 5070 (sin Ti); "
+                "no se guarda el histórico.",
+                file=sys.stderr,
+            )
+            return 0
+
+        try:
+            summary = save_run(products, now=timestamp_from_json(fecha, hora))
+        except OSError as exc:
+            print(
+                f"\n[ERROR] No se pudo guardar el histórico: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+
+        print_save_summary(summary)
+        return 0
+
     try:
-        products, ti_products, skipped, pages_scraped = scrape()
+        products, ti_products, skipped, stats = scrape()
     except ScraperError as exc:
         print(f"\n[ERROR] {exc}", file=sys.stderr)
         print(
@@ -893,13 +1464,19 @@ def main(argv: list[str] | None = None) -> int:
                 "de detenerse.",
                 file=sys.stderr,
             )
+            partial_stats = exc.stats or ScrapeStats(
+                pages_scraped=exc.pages_scraped,
+                cards_total=len(exc.products) + len(exc.ti_products),
+                unique_skus=len(exc.products) + len(exc.ti_products),
+            )
             print_results(
                 exc.products,
                 exc.ti_products,
                 exc.skipped,
-                exc.pages_scraped,
+                partial_stats,
                 time.monotonic() - started,
                 partial=True,
+                saving=False,
             )
         return 2
     except PlaywrightError as exc:
@@ -913,7 +1490,12 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print_results(
-        products, ti_products, skipped, pages_scraped, time.monotonic() - started
+        products,
+        ti_products,
+        skipped,
+        stats,
+        time.monotonic() - started,
+        saving=not args.no_save,
     )
 
     if args.no_save:
@@ -921,26 +1503,28 @@ def main(argv: list[str] | None = None) -> int:
 
     if not products:
         print(
-            "\n[AVISO] No hay productos con RTX 5070; no se guarda el históríco.",
+            "\n[AVISO] No hay productos con RTX 5070; no se guarda el histórico.",
             file=sys.stderr,
         )
         return 0
 
-    # Build the data for save_run: pair each product with its historical rows
-    history = load_history()
-    
-    # Para cada producto, encontrar sus filas históríricas
-    products_with_history = []
-    for product in products:
-        # Encontrar todas las filas de histórírico para este SKU
-        sku_history = [row for row in history if row["sku"] == product.sku]
-        products_with_history.append((product, sku_history))
-    
+    # Volcado de seguridad justo antes de guardar: si el guardado falla, el
+    # scrapeo de varios minutos no se pierde y se puede reimportar con
+    # --from-json debug/last_scrape.json.
+    ahora = datetime.now()
     try:
-        summary = save_run(products_with_history)
-    except (OSError, ) as exc:
+        dump_last_scrape(products, ti_products, skipped, stats, now=ahora)
+    except Exception as exc:
         print(
-            f"\n[ERROR] No se pudo guardar el históríco: {exc}",
+            f"\n[AVISO] No se pudo escribir {LAST_SCRAPE_FILE}: {exc}",
+            file=sys.stderr,
+        )
+
+    try:
+        summary = save_run(products, now=ahora)
+    except OSError as exc:
+        print(
+            f"\n[ERROR] No se pudo guardar el histórico: {exc}",
             file=sys.stderr,
         )
         return 1

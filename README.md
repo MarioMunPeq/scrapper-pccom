@@ -45,7 +45,17 @@ git push
 python scraper.py                    # Modo normal: Chrome visible, guarda histórico
 python scraper.py --no-save          # Solo muestra tabla por consola, no guarda historial
 python scraper.py --headless         # Modo headless (sin interfaz gráfica)
+python scraper.py --from-json debug\last_scrape.json   # No scrapea: solo guarda desde JSON
+python scraper.py --from-json debug\last_scrape.json --data-dir C:\temp\datos
 ```
+
+- Antes de guardar, el scraper vuelca los productos recogidos en
+  `debug/last_scrape.json`. Si el guardado falla, puedes reintentarlo sin volver
+  a scrapear con `--from-json debug\last_scrape.json`.
+- `--from-json` usa la `fecha`/`hora` incluidas en el JSON, para conservar el
+  momento real de la observación.
+- `PCT_DATA_DIR` o `--data-dir` permiten escribir el histórico en otra carpeta
+  (útil para pruebas sin tocar `data/`).
 
 ### Salida esperada (resumida)
 
