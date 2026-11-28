@@ -1,140 +1,156 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
-import Detail from './pages/Detail'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import Home from './pages/Home'
-import Listing from './pages/Listing'
+import Catalog from './pages/Catalog'
+import Product from './pages/Product'
+import Favorites from './pages/Favorites'
+import SiteHeader from './components/SiteHeader'
+import TabBar from './components/TabBar'
+import SiteFooter from './components/SiteFooter'
+import StaleStrip from './components/StaleStrip'
 import {
-  filterProducts,
+  applyCatalogParams,
+  defaultSort,
   initialFilters,
+  loadDataset,
   loadFavorites,
-  parseRoute,
   saveFavorites,
-  sortProducts,
+  SORT_ORDER,
+  type Dataset,
   type Filters,
-  type HistoryMap,
-  type Product,
-  type Route,
-} from './lib'
+  type Meta,
+  type SortKey,
+} from './lib/data'
+import { parseRoute, productHref, type Route } from './lib/router'
+import {
+  destroySmoothScroll,
+  getLenis,
+  gsap,
+  initSmoothScroll,
+  prefersReducedMotion,
+} from './lib/motion'
+import { formatDayMonth } from './lib/format'
 
-const DATA_BASE = import.meta.env.BASE_URL
-
-function HomeIcon() {
-  return (
-    <svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true">
-      <path
-        d="M3 8.4L10 2.8l7 5.6V17a1 1 0 0 1-1 1h-4v-5H8v5H4a1 1 0 0 1-1-1z"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="1.4"
-        strokeLinejoin="round"
-      />
-    </svg>
-  )
+const EMPTY_META: Meta = {
+  generatedAt: '',
+  lastScrape: null,
+  lastScrapeTime: '',
+  scrapes: [],
+  totals: { entries: 0, active: 0, discontinued: 0, withPrice: 0, withPvpr: 0 },
 }
 
-function ListIcon() {
-  return (
-    <svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true">
-      <path
-        d="M3 5h14M3 10h14M3 15h9"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="1.5"
-        strokeLinecap="round"
-      />
-    </svg>
-  )
+function asSort(value: string | undefined, fallback: SortKey): SortKey {
+  return value && (SORT_ORDER as string[]).includes(value) ? (value as SortKey) : fallback
 }
 
-function StarIcon() {
+function LoadingView() {
   return (
-    <svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true">
-      <path
-        d="M10 2.4l2.3 4.8 5.3.8-3.8 3.7.9 5.3L10 14.5 5.3 17l.9-5.3L2.4 8l5.3-.8z"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="1.4"
-        strokeLinejoin="round"
-      />
-    </svg>
+    <div className="page">
+      <div className="container">
+        <div className="skeleton" style={{ width: '58%', height: 64, marginTop: 24 }} />
+        <div className="skeleton" style={{ width: '38%', height: 20, marginTop: 20 }} />
+        <div className="product-grid" aria-hidden="true" style={{ marginTop: 40 }}>
+          {Array.from({ length: 9 }, (_, index) => (
+            <div className="card-skeleton" key={index}>
+              <div className="skeleton" style={{ width: '42%', height: 12 }} />
+              <div className="skeleton" style={{ width: '92%', height: 22 }} />
+              <div className="skeleton" style={{ width: '70%', height: 22 }} />
+              <div className="skeleton" style={{ width: 120, height: 32, marginTop: 'auto' }} />
+            </div>
+          ))}
+        </div>
+        <p className="mono-label" role="status" style={{ marginTop: 24 }}>
+          Cargando precios e histórico…
+        </p>
+      </div>
+    </div>
   )
 }
 
 export default function App() {
-  const [products, setProducts] = useState<Product[]>([])
-  const [history, setHistory] = useState<HistoryMap>({})
+  const [dataset, setDataset] = useState<Dataset | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-
   const [route, setRoute] = useState<Route>(() => parseRoute(window.location.hash))
   const [filters, setFilters] = useState<Filters>({ ...initialFilters })
+  const [sort, setSort] = useState<SortKey>('price-asc')
+  const [page, setPage] = useState(1)
   const [favorites, setFavorites] = useState<Set<string>>(() => loadFavorites())
+  const [originView, setOriginView] = useState<'home' | 'catalog' | 'favorites'>('catalog')
 
-  const savedScroll = useRef(0)
-  const pendingScroll = useRef<number | null>(null)
+  const mainRef = useRef<HTMLElement>(null)
+  const originRef = useRef<{ hash: string; y: number } | null>(null)
+  const pendingRestore = useRef<{ hash: string; y: number } | null>(null)
+  const previousRoute = useRef<Route>(route)
+  const routeKey = `${route.view}-${route.sku ?? ''}`
 
   useEffect(() => {
     let cancelled = false
+    if ('scrollRestoration' in window.history) window.history.scrollRestoration = 'manual'
 
-    async function load() {
-      try {
-        const [pricesResponse, historyResponse] = await Promise.all([
-          fetch(`${DATA_BASE}data/prices.json`, { cache: 'no-cache' }),
-          fetch(`${DATA_BASE}data/history.json`, { cache: 'no-cache' }).catch(() => null),
-        ])
-
-        if (!pricesResponse.ok) {
-          throw new Error(`No se pudo cargar prices.json (HTTP ${pricesResponse.status})`)
-        }
-
-        const pricesJson: unknown = await pricesResponse.json()
-        if (!Array.isArray(pricesJson)) {
-          throw new Error('prices.json no tiene el formato esperado')
-        }
-
-        let historyJson: HistoryMap = {}
-        if (historyResponse && historyResponse.ok) {
-          try {
-            const parsed: unknown = await historyResponse.json()
-            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-              historyJson = parsed as HistoryMap
-            }
-          } catch {
-            historyJson = {}
-          }
-        }
-
+    loadDataset()
+      .then((data) => {
         if (cancelled) return
-        setProducts(pricesJson as Product[])
-        setHistory(historyJson)
+        setDataset(data)
+        const current = parseRoute(window.location.hash)
+        let nextSort = defaultSort(data.meta.scrapes)
+        if (current.view === 'catalog' && current.catalog) {
+          nextSort = asSort(current.catalog.sort, nextSort)
+          setFilters((existing) => applyCatalogParams(existing, current.catalog!))
+          setPage(1)
+        }
+        setSort(nextSort)
         setError(null)
-      } catch (loadError) {
+      })
+      .catch((loadError: unknown) => {
         if (cancelled) return
-        setError(loadError instanceof Error ? loadError.message : 'Error desconocido al cargar los datos')
-      } finally {
+        setError(
+          loadError instanceof Error
+            ? loadError.message
+            : 'Error desconocido al cargar los datos'
+        )
+      })
+      .finally(() => {
         if (!cancelled) setLoading(false)
-      }
-    }
+      })
 
-    load()
     return () => {
       cancelled = true
     }
   }, [])
 
   useEffect(() => {
+    initSmoothScroll()
+    return () => destroySmoothScroll()
+  }, [])
+
+  useEffect(() => {
     const onHashChange = () => {
       const next = parseRoute(window.location.hash)
+      const previous = previousRoute.current
+      previousRoute.current = next
       setRoute(next)
 
-      if (next.view === 'list' && pendingScroll.current !== null) {
-        const y = pendingScroll.current
-        pendingScroll.current = null
-        requestAnimationFrame(() => {
-          requestAnimationFrame(() => window.scrollTo(0, y))
-        })
-      } else {
-        window.scrollTo(0, 0)
+      if (next.view === 'catalog' && next.catalog) {
+        setFilters((existing) => applyCatalogParams(existing, next.catalog!))
+        if (next.catalog.sort) {
+          setSort((current) => asSort(next.catalog!.sort, current))
+        }
+        setPage(1)
       }
+
+      const origin = originRef.current
+      const restore =
+        pendingRestore.current ??
+        (previous.view === 'product' && origin && origin.hash === next.hash ? origin : null)
+      pendingRestore.current = null
+
+      const applyScroll = () => {
+        const lenis = getLenis()
+        const y = restore ? restore.y : 0
+        if (lenis) lenis.scrollTo(y, { immediate: true })
+        else window.scrollTo(0, y)
+      }
+      requestAnimationFrame(() => requestAnimationFrame(applyScroll))
     }
 
     window.addEventListener('hashchange', onHashChange)
@@ -142,25 +158,22 @@ export default function App() {
   }, [])
 
   useEffect(() => {
-    const names: Record<Route['view'], string> = {
+    const titles: Record<Route['view'], string> = {
       home: 'Resumen',
-      list: 'Catálogo',
-      detail: 'Ficha de producto',
+      catalog: 'Catálogo',
+      product: 'Ficha de producto',
+      favorites: 'Favoritos',
     }
-    document.title = `${names[route.view]} · Precios PcComponentes`
-  }, [route])
+    document.title = `${titles[route.view]} · tracker/5070`
+  }, [route.view])
 
-  const filtered = useMemo(
-    () => sortProducts(filterProducts(products, filters, favorites), filters.sort),
-    [products, filters, favorites]
-  )
+  useEffect(() => {
+    const node = mainRef.current
+    if (!node || prefersReducedMotion()) return
+    gsap.fromTo(node, { opacity: 0, y: 12 }, { opacity: 1, y: 0, duration: 0.35, ease: 'power2.out' })
+  }, [routeKey])
 
-  const selectedProduct = useMemo(
-    () => (route.sku ? products.find((product) => product.sku === route.sku) ?? null : null),
-    [products, route.sku]
-  )
-
-  const toggleFavorite = (sku: string) => {
+  const toggleFavorite = useCallback((sku: string) => {
     setFavorites((current) => {
       const next = new Set(current)
       if (next.has(sku)) next.delete(sku)
@@ -168,128 +181,160 @@ export default function App() {
       saveFavorites(next)
       return next
     })
-  }
+  }, [])
 
-  const rememberScroll = () => {
-    savedScroll.current = window.scrollY
-  }
+  const openProduct = useCallback((sku: string) => {
+    const currentHash = window.location.hash || '#/'
+    if (currentHash.startsWith('#/product/')) return
+    originRef.current = { hash: currentHash, y: window.scrollY }
+    setOriginView(
+      currentHash.startsWith('#/favoritos')
+        ? 'favorites'
+        : currentHash === '#/' || currentHash === ''
+          ? 'home'
+          : 'catalog'
+    )
+    window.location.hash = productHref(sku)
+  }, [])
 
-  const goBackToList = () => {
-    pendingScroll.current = savedScroll.current
-    if (window.location.hash === '#/listado') {
-      window.scrollTo(0, savedScroll.current)
+  const backFromProduct = useCallback(() => {
+    const origin = originRef.current
+    if (origin && origin.hash !== window.location.hash) {
+      pendingRestore.current = origin
+      window.location.hash = origin.hash
       return
     }
-    window.location.hash = '#/listado'
-  }
+    window.location.hash = '#/catalogo'
+  }, [])
 
-  const openFavorites = () => {
-    setFilters((current) => ({ ...current, onlyFavorites: true }))
-    if (route.view !== 'list') window.location.hash = '#/listado'
-    else window.scrollTo(0, 0)
-  }
+  const clearFilters = useCallback(() => {
+    setFilters({ ...initialFilters })
+    setPage(1)
+  }, [])
 
-  const navItems = [
-    { key: 'home', label: 'Resumen', href: '#/', icon: <HomeIcon />, active: route.view === 'home' },
-    {
-      key: 'list',
-      label: 'Catálogo',
-      href: '#/listado',
-      icon: <ListIcon />,
-      active: route.view === 'list' || route.view === 'detail',
-    },
-  ]
+  const changeSort = useCallback((next: SortKey) => {
+    setSort(next)
+    setPage(1)
+  }, [])
+
+  const products = dataset?.products ?? []
+  const meta = dataset?.meta ?? EMPTY_META
+  const history = dataset?.history ?? {}
+  const selected =
+    route.sku && dataset
+      ? dataset.products.find((product) => product.sku === route.sku) ?? null
+      : null
+  const series = route.sku && history[route.sku] ? history[route.sku] : []
+  const lastUpdated = dataset
+    ? `${dataset.meta.lastScrape ?? ''} ${dataset.meta.lastScrapeTime ?? ''}`.trim() || null
+    : null
+  const backLabel =
+    originView === 'home'
+      ? 'Volver al resumen'
+      : originView === 'favorites'
+        ? 'Volver a favoritos'
+        : 'Volver al catálogo'
+
+  const content = useMemo(() => {
+    if (loading) return <LoadingView />
+    if (error) {
+      return (
+        <div className="page">
+          <div className="container">
+            <div className="fatal" role="alert">
+              <p className="eyebrow">Error de datos</p>
+              <h1>No se han podido cargar los precios.</h1>
+              <p>{error}</p>
+              <button
+                type="button"
+                className="btn btn--primary"
+                onClick={() => window.location.reload()}
+              >
+                Reintentar
+              </button>
+            </div>
+          </div>
+        </div>
+      )
+    }
+    if (route.view === 'product') {
+      return (
+        <Product
+          product={selected}
+          series={series}
+          isFavorite={route.sku ? favorites.has(route.sku) : false}
+          backLabel={backLabel}
+          onToggleFavorite={() => route.sku && toggleFavorite(route.sku)}
+          onBack={backFromProduct}
+        />
+      )
+    }
+    if (route.view === 'catalog') {
+      return (
+        <Catalog
+          products={products}
+          meta={meta}
+          filters={filters}
+          sort={sort}
+          favorites={favorites}
+          page={page}
+          onPageChange={setPage}
+          onFiltersChange={setFilters}
+          onSortChange={changeSort}
+          onToggleFavorite={toggleFavorite}
+          onOpenProduct={openProduct}
+          onClearFilters={clearFilters}
+        />
+      )
+    }
+    if (route.view === 'favorites') {
+      return (
+        <Favorites
+          products={products}
+          favorites={favorites}
+          onToggleFavorite={toggleFavorite}
+          onOpenProduct={openProduct}
+        />
+      )
+    }
+    return <Home products={products} meta={meta} onOpenProduct={openProduct} />
+  }, [
+    loading,
+    error,
+    route.view,
+    route.sku,
+    products,
+    meta,
+    filters,
+    sort,
+    favorites,
+    page,
+    selected,
+    series,
+    backLabel,
+    toggleFavorite,
+    openProduct,
+    backFromProduct,
+    clearFilters,
+    changeSort,
+  ])
 
   return (
     <div className="app">
       <a className="skip-link" href="#main">
         Saltar al contenido
       </a>
-
-      <nav className="rail" aria-label="Navegación principal">
-        <a className="rail__brand" href="#/" aria-label="Inicio · Precios PcComponentes">
-          <span className="rail__mark" aria-hidden="true">
-            PC
-          </span>
-        </a>
-        <div className="rail__links">
-          {navItems.map((item) => (
-            <a
-              key={item.key}
-              className={`rail__link${item.active ? ' is-active' : ''}`}
-              href={item.href}
-              aria-current={item.active ? 'page' : undefined}
-            >
-              {item.icon}
-              <span>{item.label}</span>
-            </a>
-          ))}
-          <button
-            type="button"
-            className={`rail__link rail__link--button${
-              route.view === 'list' && filters.onlyFavorites ? ' is-active' : ''
-            }`}
-            onClick={openFavorites}
-          >
-            <StarIcon />
-            <span>Favoritos</span>
-          </button>
-        </div>
-        <div className="rail__foot" aria-hidden="true">
-          <span className="rail__count">{products.length || '—'}</span>
-          <span className="rail__foot-label">PCs</span>
-        </div>
-      </nav>
-
-      <main className="app__main" id="main">
-        {error ? (
-          <div className="page">
-            <div className="empty empty--detail">
-              <h1>No se han podido cargar los datos</h1>
-              <p>{error}</p>
-              <button type="button" className="btn btn--primary" onClick={() => window.location.reload()}>
-                Reintentar
-              </button>
-            </div>
-          </div>
-        ) : route.view === 'detail' ? (
-          <Detail
-            product={selectedProduct}
-            series={route.sku && history[route.sku] ? history[route.sku] : []}
-            loading={loading}
-            isFavorite={route.sku ? favorites.has(route.sku) : false}
-            onToggleFavorite={toggleFavorite}
-            onBack={goBackToList}
-          />
-        ) : loading ? (
-          <div className="page">
-            <div className="skeleton-head" aria-hidden="true" />
-            <p className="loading-note" role="status">
-              Cargando catálogo e histórico…
-            </p>
-          </div>
-        ) : route.view === 'list' ? (
-          <Listing
-            products={filtered}
-            totalProducts={products.length}
-            filters={filters}
-            onFiltersChange={setFilters}
-            favorites={favorites}
-            onToggleFavorite={toggleFavorite}
-            onOpenDetail={rememberScroll}
-          />
-        ) : (
-          <Home products={products} history={history} />
-        )}
-
-        <footer className="site-foot">
-          <span>Scrapper PcComponentes</span>
-          <span className="site-foot__sep">·</span>
-          <span>Precios con IVA, actualizados a diario</span>
-          <span className="site-foot__sep">·</span>
-          <span>{products.length} PCs monitorizados</span>
-        </footer>
+      <SiteHeader
+        view={route.view}
+        favoritesCount={favorites.size}
+        updatedLabel={meta.lastScrape ? formatDayMonth(meta.lastScrape) : null}
+      />
+      <StaleStrip lastScrape={meta.lastScrape} />
+      <main id="main" ref={mainRef} data-route={route.view}>
+        {content}
       </main>
+      <SiteFooter lastUpdated={lastUpdated} />
+      <TabBar view={route.view} favoritesCount={favorites.size} />
     </div>
   )
 }

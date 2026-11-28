@@ -5,49 +5,69 @@ interface SparklineProps {
   className?: string
 }
 
-/**
- * Sparkline mínima: solo dibuja si hay 2+ puntos reales.
- * No inventa datos ni rellena huecos.
- */
 export default function Sparkline({
   values,
   width = 96,
-  height = 26,
-  className,
+  height = 32,
+  className = '',
 }: SparklineProps) {
-  const points = values.filter((v) => Number.isFinite(v))
-  if (points.length < 2) return null
+  const clean = values.filter((value) => Number.isFinite(value)).slice(-30)
+  const pad = 4
+  if (clean.length === 0) {
+    return <svg width={width} height={height} className={className} aria-hidden="true" />
+  }
 
-  const min = Math.min(...points)
-  const max = Math.max(...points)
-  const span = max - min || 1
-  const pad = 3
-  const stepX = (width - pad * 2) / (points.length - 1)
+  const min = Math.min(...clean)
+  const max = Math.max(...clean)
+  const span = max - min
+  const domainMin = span === 0 ? min - 1 : min - span * 0.1
+  const domainMax = span === 0 ? max + 1 : max + span * 0.1
+  const x = (index: number) =>
+    clean.length === 1 ? width / 2 : pad + (index / (clean.length - 1)) * (width - pad * 2)
+  const y = (value: number) =>
+    height - pad - ((value - domainMin) / (domainMax - domainMin)) * (height - pad * 2)
 
-  const coords = points.map((value, index) => {
-    const x = pad + index * stepX
-    const y = height - pad - ((value - min) / span) * (height - pad * 2)
-    return [x, y] as const
-  })
+  const trend =
+    clean.length < 2
+      ? 'flat'
+      : clean[clean.length - 1] < clean[0]
+        ? 'down'
+        : clean[clean.length - 1] > clean[0]
+          ? 'up'
+          : 'flat'
 
-  const path = coords
-    .map(([x, y], index) => `${index === 0 ? 'M' : 'L'}${x.toFixed(1)} ${y.toFixed(1)}`)
-    .join(' ')
-  const last = coords[coords.length - 1]
-  const falling = points[points.length - 1] <= points[0]
-  const stroke = falling ? 'var(--positive)' : 'var(--negative)'
+  const points = clean.map((value, index) => `${x(index)} ${y(value)}`).join(' L ')
+  const lastX = x(clean.length - 1)
+  const lastY = y(clean[clean.length - 1])
 
   return (
     <svg
-      className={className}
       width={width}
       height={height}
       viewBox={`0 0 ${width} ${height}`}
+      className={`sparkline sparkline--${trend} ${className}`.trim()}
       aria-hidden="true"
       focusable="false"
     >
-      <path d={path} fill="none" stroke={stroke} strokeWidth="1.4" strokeLinejoin="round" />
-      <circle cx={last[0]} cy={last[1]} r="2" fill={stroke} />
+      {clean.length > 1 && (
+        <path
+          d={`M ${points}`}
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.5"
+          strokeLinejoin="round"
+          strokeLinecap="round"
+          vectorEffect="non-scaling-stroke"
+        />
+      )}
+      <circle
+        cx={lastX}
+        cy={lastY}
+        r={clean.length === 1 ? 2 : 2.5}
+        fill="currentColor"
+        stroke="var(--bg)"
+        strokeWidth={clean.length === 1 ? 0 : 1}
+      />
     </svg>
   )
 }

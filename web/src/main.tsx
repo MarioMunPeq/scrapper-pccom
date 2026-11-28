@@ -2,12 +2,13 @@ import React from 'react'
 import ReactDOM from 'react-dom/client'
 import App from './App'
 
-import '@fontsource/public-sans/400.css'
-import '@fontsource/public-sans/500.css'
-import '@fontsource/public-sans/600.css'
-import '@fontsource/jetbrains-mono/400.css'
-import '@fontsource/jetbrains-mono/500.css'
-import './style.css'
+import '@fontsource/instrument-serif/400.css'
+import '@fontsource/instrument-serif/400-italic.css'
+import '@fontsource-variable/geist/wght.css'
+import '@fontsource-variable/geist-mono/wght.css'
+import './styles/tokens.css'
+import './styles/base.css'
+import './styles/components.css'
 
 // ============================================================
 // Error boundary: evita la "pantalla en gris" si el render falla
@@ -33,29 +34,19 @@ class ErrorBoundary extends React.Component<
   render() {
     if (this.state.error) {
       return (
-        <div role="alert" className="empty empty--detail" style={{ margin: '3rem auto', maxWidth: 620 }}>
-          <h1>Se ha producido un error</h1>
-          <p>La aplicación no ha podido mostrarse correctamente.</p>
-          <pre
-            style={{
-              whiteSpace: 'pre-wrap',
-              wordBreak: 'break-word',
-              fontSize: '0.78rem',
-              fontFamily: 'var(--font-mono)',
-              color: 'var(--text-dim)',
-              background: 'var(--ground-deep)',
-              border: '1px solid var(--line)',
-              padding: '0.75rem',
-              borderRadius: 2,
-              margin: 0,
-              width: '100%',
-            }}
-          >
-            {this.state.error.message}
-          </pre>
-          <button type="button" className="btn btn--primary" onClick={() => window.location.reload()}>
-            Recargar
-          </button>
+        <div className="container">
+          <div role="alert" className="fatal">
+            <p className="eyebrow">Error de render</p>
+            <h1>La aplicación no ha podido mostrarse.</h1>
+            <p>{this.state.error.message}</p>
+            <button
+              type="button"
+              className="btn btn--primary"
+              onClick={() => window.location.reload()}
+            >
+              Recargar
+            </button>
+          </div>
         </div>
       )
     }
@@ -77,7 +68,7 @@ if (!faviconLink) {
 faviconLink.type = 'image/svg+xml'
 faviconLink.href = faviconHref
 
-// El enrutado por hash (#/, #/listado, #/product/SKU) vive en App.
+// El enrutado por hash (#/, #/catalogo, #/product/SKU) vive en App.
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <ErrorBoundary>

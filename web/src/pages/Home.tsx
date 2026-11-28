@@ -1,296 +1,415 @@
-import { useMemo, useRef } from 'react'
-import MedianChart from '../components/MedianChart'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { ArrowRight } from 'lucide-react'
+import PriceChart from '../components/PriceChart'
+import Sparkline from '../components/Sparkline'
+import ChipDelta from '../components/ChipDelta'
+import Segmented from '../components/Segmented'
+import type { Meta, Product } from '../lib/data'
+import { activeProducts, datasetStats, movements, priceRanges } from '../lib/data'
 import {
-  computeGlobalSeries,
-  formatDate,
   formatDateTime,
+  formatDayMonth,
+  formatNumber,
   formatPct,
-  formatPrice0,
-  intFmt,
-  latestUpdate,
-  median,
-  shortName,
-  type HistoryMap,
-  type Product,
-} from '../lib'
+  formatPrice,
+  formatPrice2,
+  formatPriceRange,
+} from '../lib/format'
+import { catalogHref, HREFS, productHref } from '../lib/router'
+import { MILESTONES } from '../lib/milestones'
+import { gsap, prefersReducedMotion, revealSections, scrollToTarget } from '../lib/motion'
 
 interface HomeProps {
   products: Product[]
-  history: HistoryMap
+  meta: Meta
+  onOpenProduct: (sku: string) => void
 }
 
-export default function Home({ products, history }: HomeProps) {
-  const dropsRef = useRef<HTMLElement | null>(null)
+type MovementTab = 'down' | 'up' | 'new'
 
-  const stats = useMemo(() => {
-    const prices = products
-      .map((product) => product.currentPrice)
-      .filter((price): price is number => price !== null && Number.isFinite(price))
-    const withDiscount = products.filter(
-      (product) => product.discountPvpr !== null && product.discountPvpr > 0
-    )
-    const cheapest = [...products]
-      .filter((product) => product.currentPrice !== null)
-      .sort((a, b) => (a.currentPrice as number) - (b.currentPrice as number))[0]
-    const priciest = [...products]
-      .filter((product) => product.currentPrice !== null)
-      .sort((a, b) => (b.currentPrice as number) - (a.currentPrice as number))[0]
+function trendClass(values: number[]): string {
+  if (values.length < 2) return 'is-flat'
+  if (values[values.length - 1] < values[0]) return 'is-down'
+  if (values[values.length - 1] > values[0]) return 'is-up'
+  return 'is-flat'
+}
 
-    return {
-      total: products.length,
-      medianPrice: median(prices),
-      minPrice: prices.length ? Math.min(...prices) : null,
-      maxPrice: prices.length ? Math.max(...prices) : null,
-      withDiscount: withDiscount.length,
-      discountPct: products.length ? (withDiscount.length / products.length) * 100 : 0,
-      cheapest,
-      priciest,
-      updated: latestUpdate(products),
-      days: Math.max(0, ...products.map((product) => product.numDiasHistorial)),
+function MovementRow({
+  product,
+  rank,
+  mode,
+  onOpen,
+}: {
+  product: Product
+  rank: number
+  mode: MovementTab
+  onOpen: (sku: string) => void
+}) {
+  const isNew = mode === 'new'
+  const values = product.sparkline.length
+    ? product.sparkline
+    : product.currentPrice !== null
+      ? [product.currentPrice]
+      : []
+  return (
+    <a
+      className="movement"
+      href={productHref(product.sku)}
+      onClick={() => onOpen(product.sku)}
+    >
+      <span className="movement__pos">{String(rank + 1).padStart(2, '0')}</span>
+      <span className="movement__body">
+        <span className="movement__name">{product.shortName}</span>
+        <span className="movement__meta">
+          <span>{product.cpuFamily}</span>
+          <span aria-hidden="true">·</span>
+          <span>{product.availabilityShort || `${product.numDiasHistorial} días de histórico`}</span>
+        </span>
+      </span>
+      <span className="movement__spark" aria-hidden="true">
+        <Sparkline values={values} className={trendClass(values)} />
+      </span>
+      <span className="movement__prices">
+        <span className="movement__old">
+          {isNew
+            ? product.firstSeen
+              ? `Desde ${formatDayMonth(product.firstSeen)}`
+              : 'Primera observación'
+            : formatPrice(product.prevPrice)}
+        </span>
+        <span className="movement__new">{formatPrice2(product.currentPrice)}</span>
+      </span>
+      <span className="movement__chip">
+        {isNew ? (
+          <span className="badge badge--new" data-micro="true">Nuevo</span>
+        ) : (
+          <ChipDelta pct={product.deltaPct} abs={product.deltaAbs} />
+        )}
+      </span>
+    </a>
+  )
+}
+
+export default function Home({ products, meta, onOpenProduct }: HomeProps) {
+  const scopeRef = useRef<HTMLDivElement>(null)
+  const titleRef = useRef<HTMLHeadingElement>(null)
+  const [tab, setTab] = useState<MovementTab>('down')
+
+  const active = useMemo(() => activeProducts(products), [products])
+  const stats = useMemo(
+    () => datasetStats({ products, history: {}, meta }),
+    [products, meta]
+  )
+  const down = useMemo(() => movements(products, 'down', 8), [products])
+  const up = useMemo(() => movements(products, 'up', 8), [products])
+  const fresh = useMemo(
+    () => active.filter((product) => product.isNew).slice(0, 8),
+    [active]
+  )
+  const ranges = useMemo(() => priceRanges(active, 500), [active])
+  const maxRange = Math.max(1, ...ranges.map((bucket) => bucket.count))
+  const rangeTotal = ranges.reduce((sum, bucket) => sum + bucket.count, 0)
+  const medians = meta.scrapes
+    .filter((scrape) => scrape.median !== null)
+    .map((scrape) => [scrape.date, scrape.median] as [string, number])
+  const dropBars = meta.scrapes.map((scrape) => ({ date: scrape.date, value: scrape.drops }))
+  const previous = meta.scrapes.length >= 2 ? meta.scrapes[meta.scrapes.length - 2] : null
+  const firstScrape = meta.scrapes[0]
+  const lastScrape = meta.scrapes[meta.scrapes.length - 1]
+
+  useEffect(() => {
+    if (prefersReducedMotion() || !scopeRef.current) return
+    const scope = scopeRef.current
+    const context = gsap.context(() => {
+      const lines = titleRef.current?.querySelectorAll<HTMLElement>('.hero__line > span')
+      if (lines && lines.length) {
+        gsap.fromTo(
+          lines,
+          { yPercent: 110 },
+          { yPercent: 0, duration: 0.9, stagger: 0.08, ease: 'power3.out', delay: 0.08 }
+        )
+      }
+      gsap.fromTo(
+        '.hero__lead, .hero__actions, .hero__meta, .hero-panel',
+        { opacity: 0, y: 16 },
+        { opacity: 1, y: 0, duration: 0.7, stagger: 0.08, ease: 'power2.out', delay: 0.3 }
+      )
+    }, scope)
+    const cleanup = revealSections(scope)
+    return () => {
+      context.revert()
+      cleanup()
     }
-  }, [products])
+  }, [])
 
-  const globalSeries = useMemo(() => computeGlobalSeries(history), [history])
-  const hasComparison = stats.days >= 2
-
-  const topDrops = useMemo(
-    () =>
-      products
-        .filter((product) => product.recentDropPct !== null && product.recentDropPct > 0)
-        .sort((a, b) => (b.recentDropPct as number) - (a.recentDropPct as number))
-        .slice(0, 6),
-    [products]
-  )
-
-  const topDiscounts = useMemo(
-    () =>
-      products
-        .filter((product) => product.discountPvpr !== null && product.discountPvpr > 0)
-        .sort((a, b) => (b.discountPvpr as number) - (a.discountPvpr as number))
-        .slice(0, 6),
-    [products]
-  )
-
-  const lastGlobal = globalSeries[globalSeries.length - 1]
+  const currentList =
+    tab === 'down'
+      ? down.map((movement) => ({ product: movement.product, mode: 'down' as const }))
+      : tab === 'up'
+        ? up.map((movement) => ({ product: movement.product, mode: 'up' as const }))
+        : fresh.map((product) => ({ product, mode: 'new' as const }))
 
   return (
-    <div className="page page--home">
-      <header className="hero">
-        <div className="hero__copy">
-          <p className="eyebrow">
-            <span className="dot" aria-hidden="true" />
-            PcComponentes · {intFmt.format(stats.total)} equipos monitorizados
-          </p>
-          <h1>
-            El precio real de cada PC,
-            <br />
-            <span className="hero__accent">día a día.</span>
-          </h1>
-          <p className="hero__lead">
-            Histórico propio de precios de ordenadores de sobremesa. Sin descuentos inventados:
-            cada cifra sale de un scrape diario y se puede comprobar en el histórico de cada
-            producto.
-          </p>
-          <div className="hero__actions">
-            <a className="btn btn--primary" href="#/listado">
-              Explorar los {intFmt.format(stats.total)} PCs
-            </a>
-            <button
-              type="button"
-              className="btn btn--ghost"
-              onClick={() => dropsRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })}
-            >
-              Ver quién baja de precio
-            </button>
-          </div>
-          <p className="hero__meta">
-            {stats.updated
-              ? `Última actualización: ${formatDateTime(stats.updated)}`
-              : 'Todavía sin datos de precios'}
-            <span className="hero__meta-sep">·</span>
-            Precios actualizados a diario
-            <span className="hero__meta-sep">·</span>
-            {hasComparison
-              ? `${stats.days} días de histórico`
-              : 'Histórico en construcción'}
-          </p>
-        </div>
+    <div className="page home" ref={scopeRef}>
+      <div className="home-glow" aria-hidden="true" />
 
-        <div className="hero__panel" aria-label="Resumen del mercado">
-          <span className="hero__panel-label">Mediana hoy</span>
-          <strong className="hero__panel-value">{formatPrice0(stats.medianPrice)}</strong>
-          <span className="hero__panel-note">
-            {lastGlobal
-              ? `${intFmt.format(lastGlobal.count)} equipos con precio registrado`
-              : 'Sin registros'}
-          </span>
-          <div className="hero__panel-grid">
-            <div>
-              <span className="hero__panel-key">Mínimo</span>
-              <span className="hero__panel-figure">{formatPrice0(stats.minPrice)}</span>
+      <div className="container">
+        <header className="hero">
+          <div>
+            <p className="eyebrow">
+              <span className="eyebrow__dot" aria-hidden="true" />
+              PcComponentes · {formatNumber(stats.withPrice)} equipos monitorizados
+            </p>
+            <h1 className="hero__title" ref={titleRef}>
+              <span className="hero__line">
+                <span>El precio real</span>
+              </span>
+              <span className="hero__line">
+                <span>de cada PC,</span>
+              </span>
+              <span className="hero__line hero__line--italic">
+                <span>día a día.</span>
+              </span>
+            </h1>
+            <p className="hero__lead">
+              Histórico propio de precios de ordenadores de sobremesa. Sin descuentos
+              inventados: cada cifra sale de un scrape diario y se puede comprobar en el
+              histórico de cada producto.
+            </p>
+            <div className="hero__actions">
+              <a className="btn btn--primary" href={HREFS.catalog}>
+                Explorar los {formatNumber(stats.total)} PCs
+                <ArrowRight className="btn__arrow" size={16} strokeWidth={1.7} aria-hidden="true" />
+              </a>
+              <button
+                type="button"
+                className="btn btn--ghost"
+                onClick={() => scrollToTarget('#movimientos')}
+              >
+                Ver quién se mueve
+              </button>
             </div>
-            <div>
-              <span className="hero__panel-key">Máximo</span>
-              <span className="hero__panel-figure">{formatPrice0(stats.maxPrice)}</span>
-            </div>
-            <div>
-              <span className="hero__panel-key">Con descuento</span>
-              <span className="hero__panel-figure">
-                {intFmt.format(stats.withDiscount)}
-                <small>{formatPct(stats.discountPct)}</small>
+            <p className="hero__meta">
+              <span>
+                {stats.updated
+                  ? `Última actualización ${formatDateTime(stats.updated)}`
+                  : 'Todavía sin datos'}
+              </span>
+              <span className="hero__meta-sep" aria-hidden="true">
+                ·
+              </span>
+              <span>
+                {meta.scrapes.length} {meta.scrapes.length === 1 ? 'scrape' : 'scrapes'} de
+                histórico
+              </span>
+              <span className="hero__meta-sep" aria-hidden="true">
+                ·
+              </span>
+              <span>Precios con IVA incluido</span>
+            </p>
+          </div>
+
+          <aside className="hero-panel" aria-label="Resumen del mercado">
+            <div className="hero-panel__head">
+              <span className="mono-label">Precio mediano</span>
+              <span className="hero-panel__live">
+                {meta.lastScrape ? `Act. ${formatDayMonth(meta.lastScrape)}` : 'Sin datos'}
               </span>
             </div>
-            <div>
-              <span className="hero__panel-key">Días de datos</span>
-              <span className="hero__panel-figure">{intFmt.format(stats.days)}</span>
+            <div className="hero-panel__median">
+              <strong className="hero-panel__value">{formatPrice(stats.medianPrice)}</strong>
             </div>
-          </div>
-        </div>
-      </header>
-
-      <section className="section" aria-labelledby="kpi-title">
-        <div className="section__head">
-          <h2 id="kpi-title">Radiografía del catálogo</h2>
-          <p className="section__note">Calculado sobre los {intFmt.format(stats.total)} PCs con datos.</p>
-        </div>
-        <div className="kpis">
-          <div className="kpi">
-            <span className="kpi__label">PCs monitorizados</span>
-            <strong className="kpi__value">{intFmt.format(stats.total)}</strong>
-            <span className="kpi__note">Todos con ficha y precio</span>
-          </div>
-          <div className="kpi">
-            <span className="kpi__label">Precio mediano</span>
-            <strong className="kpi__value">{formatPrice0(stats.medianPrice)}</strong>
-            <span className="kpi__note">La mitad cuesta menos</span>
-          </div>
-          <div className="kpi">
-            <span className="kpi__label">Más barato</span>
-            <strong className="kpi__value">{formatPrice0(stats.minPrice)}</strong>
-            <span className="kpi__note">{stats.cheapest ? shortName(stats.cheapest.name, 34) : '—'}</span>
-          </div>
-          <div className="kpi">
-            <span className="kpi__label">Más caro</span>
-            <strong className="kpi__value">{formatPrice0(stats.maxPrice)}</strong>
-            <span className="kpi__note">{stats.priciest ? shortName(stats.priciest.name, 34) : '—'}</span>
-          </div>
-          <div className="kpi">
-            <span className="kpi__label">Con descuento vs PVPR</span>
-            <strong className="kpi__value">{intFmt.format(stats.withDiscount)}</strong>
-            <span className="kpi__note">{formatPct(stats.discountPct)} del catálogo</span>
-          </div>
-          <div className="kpi">
-            <span className="kpi__label">Última actualización</span>
-            <strong className="kpi__value kpi__value--sm">{formatDate(stats.updated)}</strong>
-            <span className="kpi__note">
-              {stats.updated ? `${stats.updated.slice(11, 16)} h · scrape diario` : 'Sin datos'}
-            </span>
-          </div>
-        </div>
-      </section>
-
-      <section className="section" aria-labelledby="evolution-title">
-        <div className="section__head">
-          <h2 id="evolution-title">Mediana diaria y presión a la baja</h2>
-          <p className="section__note">
-            Precio mediano del catálogo cada día y cuántos PCs recortan precio respecto al día
-            anterior.
-          </p>
-        </div>
-        <div className="panel">
-          <MedianChart points={globalSeries} />
-        </div>
-      </section>
-
-      <section className="section" id="bajadas" ref={dropsRef} aria-labelledby="drops-title">
-        <div className="section__head">
-          <h2 id="drops-title">Quién se mueve</h2>
-          <p className="section__note">
-            Comparativas reales entre el último scrape y el anterior. Sin estimaciones.
-          </p>
-        </div>
-        <div className="split">
-          <div className="panel panel--list">
-            <div className="panel__head">
-              <h3>Mayores bajadas</h3>
-              <span className="panel__hint">vs día anterior</span>
+            <div className="hero-panel__caption">
+              {stats.medianDeltaPct !== null && stats.prevScrape ? (
+                <ChipDelta
+                  pct={stats.medianDeltaPct}
+                  title={`Frente al scrape del ${formatDayMonth(stats.prevScrape.date)}`}
+                />
+              ) : null}
+              <span>Mediana de {formatNumber(stats.withPrice)} PCs con precio</span>
             </div>
-            {!hasComparison || topDrops.length === 0 ? (
-              <p className="empty-note">
-                {hasComparison
-                  ? 'Hoy ningún PC ha bajado de precio respecto al día anterior.'
-                  : 'Disponible desde el próximo scrape: hacen falta al menos dos días de histórico para comparar.'}
+
+            <div className="hero-panel__grid">
+              <div>
+                <span className="hero-panel__key">Mínimo</span>
+                <strong className="hero-panel__figure">{formatPrice(stats.minPrice)}</strong>
+              </div>
+              <div>
+                <span className="hero-panel__key">Máximo</span>
+                <strong className="hero-panel__figure">{formatPrice(stats.maxPrice)}</strong>
+              </div>
+              <div>
+                <span className="hero-panel__key">Con descuento</span>
+                <strong className="hero-panel__figure">
+                  {formatNumber(stats.withDiscount)}
+                  <small>{formatPct(stats.discountShare)}</small>
+                </strong>
+              </div>
+              <div>
+                <span className="hero-panel__key">Histórico</span>
+                <strong className="hero-panel__figure">
+                  {meta.scrapes.length}
+                  <small>{meta.scrapes.length === 1 ? 'scrape' : 'scrapes'}</small>
+                </strong>
+              </div>
+            </div>
+
+            <p className="hero-panel__foot">
+              {stats.updated
+                ? `Actualizado el ${formatDateTime(stats.updated)}`
+                : 'Pendiente de datos'}
+            </p>
+          </aside>
+        </header>
+
+        <section className="section" data-reveal aria-labelledby="evolucion-title">
+          <div className="section-head">
+            <div className="section-head__main">
+              <span className="section-head__index">01</span>
+              <div>
+                <h2 id="evolucion-title">Evolución</h2>
+              </div>
+            </div>
+            <p className="section-head__note">
+              Precio mediano del catálogo en cada scrape y cuántos PCs recortan precio respecto
+              a la observación anterior.
+            </p>
+          </div>
+          <div className="chart-panel">
+            <div className="chart-panel__head">
+              <div>
+                <p className="chart-panel__title">Mediana del catálogo</p>
+                <p className="chart-panel__meta">
+                  {firstScrape && lastScrape
+                    ? `${formatDayMonth(firstScrape.date)} — ${formatDayMonth(lastScrape.date)} · ${
+                        meta.scrapes.length
+                      } ${meta.scrapes.length === 1 ? 'scrape' : 'scrapes'}`
+                    : 'Sin observaciones'}
+                </p>
+              </div>
+              <div className="legend" aria-hidden="true">
+                <span className="legend__key">
+                  <span className="legend__swatch legend__swatch--line" /> Mediana
+                </span>
+                <span className="legend__key">
+                  <span className="legend__swatch legend__swatch--bar" /> PCs que bajan
+                </span>
+              </div>
+            </div>
+            <PriceChart
+              points={medians}
+              bars={dropBars}
+              milestones={MILESTONES}
+              height={340}
+              chartLabel="Mediana diaria del catálogo"
+              emptyLabel="Sin scrapes todavía"
+            />
+          </div>
+        </section>
+
+        <section className="section" id="movimientos" data-reveal aria-labelledby="movimientos-title">
+          <div className="section-head">
+            <div className="section-head__main">
+              <span className="section-head__index">02</span>
+              <div>
+                <h2 id="movimientos-title">Movimientos</h2>
+              </div>
+            </div>
+            <p className="section-head__note">
+              Comparativas reales entre el último scrape y el anterior. Sin estimaciones ni
+              precios de relleno.
+            </p>
+          </div>
+
+          <div className="movements">
+            <div className="movements__head">
+              <Segmented
+                ariaLabel="Tipo de movimiento"
+                value={tab}
+                onChange={(value) => setTab(value as MovementTab)}
+                options={[
+                  { value: 'down', label: 'Bajadas', count: down.length },
+                  { value: 'up', label: 'Subidas', count: up.length },
+                  { value: 'new', label: 'Nuevos', count: fresh.length },
+                ]}
+              />
+              <span className="movements__hint">
+                {previous ? `vs ${formatDayMonth(previous.date)}` : 'Sin comparativa'}
+              </span>
+            </div>
+
+            {currentList.length > 0 ? (
+              <div className="movements__list">
+                {currentList.map((item, index) => (
+                  <MovementRow
+                    key={item.product.sku}
+                    product={item.product}
+                    rank={index}
+                    mode={item.mode}
+                    onOpen={onOpenProduct}
+                  />
+                ))}
+              </div>
+            ) : (
+              <p className="movements__empty">
+                {tab === 'down'
+                  ? 'Ningún PC ha bajado de precio en el último scrape.'
+                  : tab === 'up'
+                    ? 'Ningún PC ha subido de precio en el último scrape.'
+                    : 'Todavía no hay productos nuevos en el histórico.'}
               </p>
-            ) : (
-              <ol className="rank">
-                {topDrops.map((product, index) => (
-                  <li key={product.sku}>
-                    <a className="rank__row" href={`#/product/${product.sku}`}>
-                      <span className="rank__pos">{String(index + 1).padStart(2, '0')}</span>
-                      <span className="rank__body">
-                        <span className="rank__name">{shortName(product.name)}</span>
-                        <span className="rank__meta">
-                          {formatPrice0(product.previousPrice)} → {formatPrice0(product.currentPrice)}
-                        </span>
-                      </span>
-                      <span className="rank__value is-down">
-                        −{formatPct(product.recentDropPct)}
-                      </span>
-                    </a>
-                  </li>
-                ))}
-              </ol>
             )}
           </div>
+        </section>
 
-          <div className="panel panel--list">
-            <div className="panel__head">
-              <h3>Mejores descuentos</h3>
-              <span className="panel__hint">vs PVPR</span>
+        <section className="section" data-reveal aria-labelledby="rangos-title">
+          <div className="section-head">
+            <div className="section-head__main">
+              <span className="section-head__index">03</span>
+              <div>
+                <h2 id="rangos-title">Rangos de precio</h2>
+              </div>
             </div>
-            {topDiscounts.length === 0 ? (
-              <p className="empty-note">Ningún producto muestra PVPR tachado en la última captura.</p>
-            ) : (
-              <ol className="rank">
-                {topDiscounts.map((product, index) => (
-                  <li key={product.sku}>
-                    <a className="rank__row" href={`#/product/${product.sku}`}>
-                      <span className="rank__pos">{String(index + 1).padStart(2, '0')}</span>
-                      <span className="rank__body">
-                        <span className="rank__name">{shortName(product.name)}</span>
-                        <span className="rank__meta">
-                          {formatPrice0(product.currentPrice)} · PVPR {formatPrice0(product.pvpr)}
-                        </span>
-                      </span>
-                      <span className="rank__value is-up">−{formatPct(product.discountPvpr)}</span>
-                    </a>
-                  </li>
-                ))}
-              </ol>
-            )}
+            <p className="section-head__note">
+              Distribución del catálogo por precio final. Cada tramo abre el catálogo ya
+              filtrado; la barra azul marca la mediana.
+            </p>
           </div>
-        </div>
-      </section>
 
-      <section className="section section--note" aria-label="Sobre los datos">
-        <div className="method">
-          <h2>Cómo se calcula</h2>
-          <p>
-            Cada día se guarda el precio final de la ficha de PcComponentes. La mediana y los
-            rankings se recalculan con esas observaciones: no hay precios de relleno ni series
-            inventadas. Si un producto solo tiene un día de datos, su gráfico lo indica y no se
-            compara contra nada.
-          </p>
-          <p className="method__foot">
-            Precios en euros con IVA incluido · Fuente: PcComponentes ·{' '}
-            {stats.updated ? `actualizado el ${formatDate(stats.updated)}` : 'pendiente de datos'}
-          </p>
-        </div>
-        <div className="method__figure" aria-hidden="true">
-          <span>{formatPrice0(stats.medianPrice)}</span>
-          <small>precio mediano</small>
-        </div>
-      </section>
+          {ranges.length > 0 ? (
+            <div className="ranges">
+              {ranges.map((bucket) => (
+                <a
+                  key={`${bucket.from}-${bucket.to}`}
+                  className={`range-row${bucket.isMedian ? ' range-row--median' : ''}`}
+                  href={catalogHref({ range: `${bucket.from}-${bucket.to}` })}
+                >
+                  <span className="range-row__label">
+                    {formatPriceRange(bucket.from, bucket.to)}
+                    {bucket.isMedian && (
+                      <span className="range-row__tag" data-micro="true">
+                        mediana
+                      </span>
+                    )}
+                  </span>
+                  <span className="range-row__track">
+                    <span
+                      className="range-row__bar"
+                      style={{ width: `${(bucket.count / maxRange) * 100}%` }}
+                    />
+                  </span>
+                  <span className="range-row__count">{formatNumber(bucket.count)}</span>
+                  <span className="range-row__pct">
+                    {rangeTotal > 0 ? formatPct((bucket.count / rangeTotal) * 100) : '—'}
+                  </span>
+                </a>
+              ))}
+            </div>
+          ) : (
+            <p className="movements__empty">Sin precios para construir rangos.</p>
+          )}
+        </section>
+      </div>
     </div>
   )
 }

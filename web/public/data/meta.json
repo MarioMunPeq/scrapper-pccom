@@ -1,0 +1,38 @@
+{
+  "generatedAt": "2026-11-28T08:35:06.080Z",
+  "lastScrape": "2026-11-27",
+  "lastScrapeTime": "08:00:41",
+  "scrapes": [
+    {
+      "date": "2026-11-23",
+      "time": "11:09:30",
+      "skus": 646,
+      "withPrice": 646,
+      "median": 2777.73,
+      "drops": 0
+    },
+    {
+      "date": "2026-11-26",
+      "time": "09:26:55",
+      "skus": 655,
+      "withPrice": 655,
+      "median": 2784.2,
+      "drops": 12
+    },
+    {
+      "date": "2026-11-27",
+      "time": "08:00:41",
+      "skus": 654,
+      "withPrice": 654,
+      "median": 2782.1,
+      "drops": 1
+    }
+  ],
+  "totals": {
+    "entries": 658,
+    "active": 654,
+    "discontinued": 4,
+    "withPrice": 654,
+    "withPvpr": 598
+  }
+}
